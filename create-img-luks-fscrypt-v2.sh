@@ -56,7 +56,7 @@ for cmd in "${REQUIRED_COMMANDS[@]}"; do
     fi
 done
 
-REQUIRED_MODULES=(xts aes_generic ext4)
+REQUIRED_MODULES=(xts aes_generic ext4 dm_crypt)
 for mod in "${REQUIRED_MODULES[@]}"; do
     if ! modprobe -n "$mod" >/dev/null 2>&1; then
         log_warn "Kernel module '$mod' may not be available."
