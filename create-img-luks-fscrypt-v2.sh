@@ -21,7 +21,7 @@ cleanup() {
     local exit_status=$?
     if (( exit_status != 0 )); then
         log_warn "An unexpected error occurred (exit code $exit_status). Cleaning up..."
-        
+
         if (( MOUNTED )); then
             if umount -- "$MOUNT_POINT"; then
                 log_info "Successfully unmounted $MOUNT_POINT."
@@ -242,8 +242,8 @@ fi
 MAPPER_OPEN=1
 
 if (( FORMAT_IMAGE )); then
-    log_info "Creating ext4 filesystem..."
-    if ! mkfs.ext4 -L secure_vol "/dev/mapper/$MAPPER_NAME"; then
+    log_info "Creating ext4 filesystem with encryption support..."
+    if ! mkfs.ext4 -O encrypt -L secure_vol "/dev/mapper/$MAPPER_NAME"; then
         log_err "Could not create ext4 filesystem."
         exit 1
     fi
