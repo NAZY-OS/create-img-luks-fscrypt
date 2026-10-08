@@ -71,6 +71,15 @@ for mod in "${REQUIRED_MODULES[@]}"; do
     fi
 done
 
+# Globale fscrypt-Konfiguration am Anfang sicherstellen
+if [[ ! -f /etc/fscrypt.conf ]]; then
+    log_info "Initializing global fscrypt configuration (/etc/fscrypt.conf)..."
+    if ! fscrypt setup; then
+        log_err "Global fscrypt setup failed."
+        exit 1
+    fi
+fi
+
 read -r -p "Image file path (e.g. /home/user/secure.img): " IMG_PATH
 if [[ -z "$IMG_PATH" ]]; then
     log_err "No image path provided."
