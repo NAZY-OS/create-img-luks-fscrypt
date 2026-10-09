@@ -1,187 +1,68 @@
-#!/usr/bin/env python3
-#
-# fscrypt-opener D-Bus System Service
-# Licensed under GNU GPL v3
+def on_toggle_folder(self, btn, fpath, locked, method):
+        if locked:
+            key_file = ""
+            # 1. Wenn die Methode 'raw_key' ist, Key-Datei über Gtk.FileDialog auswählen
+            if method == "raw_key":
+                dialog = Gtk.FileDialog(title="Schlüsseldatei auswählen (Raw Key)")
+                dialog.open(self, None, lambda source, result: self.on_key_file_selected(source, result, fpath, method))
+                return  # Warten auf den Callback der Dateiauswahl
+            
+            # Wenn kein raw_key, direkt den Autoclose-Dialog öffnen
+            self.prompt_autoclose_and_unlock(fpath, method, key_file)
+        else:
+            if self.proxy:
+                code = self.proxy.LockFolder(fpath)
+                if code != 0:
+                    print("Sperren fehlgeschlagen.")
+            self.refresh_status()
 
-import os
-import subprocess
-import json
-from pydbus import SystemBus
-from pydbus.generic import signal
+    def on_key_file_selected(self, dialog, result, fpath, method):
+        try:
+            gfile = dialog.open_finish(result)
+            if gfile:
+                key_file = gfile.get_path()
+                self.prompt_autoclose_and_unlock(fpath, method, key_file)
+        except Exception as e:
+            print(f"Auswahl abgebrochen oder Fehler: {e}")
 
-CONFIG_DIR = "/etc/fscrypt-opener"
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
-RUN_DIR = "/run/fscrypt-opener"
+    def prompt_autoclose_and_unlock(self, fpath, method, key_file):
+        # 2. Kleiner Dialog für die Autoclose-Minuten
+        dialog = Gtk.Dialog(title="Autoclose konfigurieren", transient_for=self, modal=True)
+        dialog.add_button("Abbrechen", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Entsperren", Gtk.ResponseType.OK)
 
-class FscryptOpenerService:
-    """
-    <node>
-        <interface name="org.fscrypt.Opener">
-            <method name="GetStatus">
-                <arg type="s" name="status_json" direction="out"/>
-            </method>
-            <method name="OpenAll">
-                <arg type="i" name="exit_code" direction="out"/>
-            </method>
-            <method name="CloseAll">
-                <arg type="i" name="exit_code" direction="out"/>
-            </method>
-            <method name="UnlockFolder">
-                <arg type="s" name="target_dir" direction="in"/>
-                <arg type="s" name="method" direction="in"/>
-                <arg type="s" name="key_file" direction="in"/>
-                <arg type="i" name="autoclose_min" direction="in"/>
-                <arg type="i" name="exit_code" direction="out"/>
-            </method>
-            <method name="LockFolder">
-                <arg type="s" name="target_dir" direction="in"/>
-                <arg type="i" name="exit_code" direction="out"/>
-            </method>
-            <method name="MountImage">
-                <arg type="s" name="img_path" direction="in"/>
-                <arg type="s" name="mapper_name" direction="in"/>
-                <arg type="s" name="mount_point" direction="in"/>
-                <arg type="i" name="exit_code" direction="out"/>
-            </method>
-        </interface>
-    </node>
-    """
-    dbus = None
+        content_area = dialog.get_content_area()
+        content_area.set_margin_top(12)
+        content_area.set_margin_bottom(12)
+        content_area.set_margin_start(12)
+        content_area.set_margin_end(12)
+        content_area.set_spacing(8)
 
-    def __init__(self):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        os.makedirs(RUN_DIR, exist_ok=True)
-        if not os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "w") as f:
-                f.write("secure_img1|/var/lib/secure1.img|/mnt/secure1|custom\n")
+        content_area.append(Gtk.Label(label="Nach wie vielen Minuten soll der Ordner automatisch gesperrt werden?", xalign=0))
 
-    def GetStatus(self):
-        containers = []
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split("|")
-                    if len(parts) < 4:
-                        continue
-                    mapper, img, mount, method = [p.strip() for p in parts]
+        entry_minutes = Gtk.Entry()
+        entry_minutes.set_text("10")  # Standardwert
+        content_area.append(entry_minutes)
 
-                    luks_locked = True
-                    actual_mount = "N/A"
-                    res = subprocess.run(["cryptsetup", "status", mapper], capture_output=True)
-                    if res.returncode == 0:
-                        luks_locked = False
-                        # Mountpunkt ermitteln
-                        mres = subprocess.run(["findmnt", "-n", "-o", "TARGET", f"/dev/mapper/{mapper}"], capture_output=True, text=True)
-                        actual_mount = mres.stdout.strip() or mount
+        dialog.connect("response", lambda d, r: self.on_autoclose_dialog_response(d, r, fpath, method, key_file, entry_minutes))
+        dialog.present()
 
-                    folders = []
-                    if not luks_locked and os.path.isdir(actual_mount):
-                        for entry in os.listdir(actual_mount):
-                            if entry.startswith(".") or entry == "lost+found":
-                                continue
-                            fpath = os.path.join(actual_mount, entry)
-                            if os.path.isdir(fpath):
-                                flocked = True
-                                sres = subprocess.run(["fscrypt", "status", fpath], capture_output=True, text=True)
-                                if "unlocked: yes" in sres.stdout.lower():
-                                    flocked = False
-                                folders.append({
-                                    "name": entry,
-                                    "path": fpath,
-                                    "locked": flocked,
-                                    "method": method
-                                })
+    def on_autoclose_dialog_response(self, dialog, response, fpath, method, key_file, entry_minutes):
+        autoclose_min = 10
+        if response == Gtk.ResponseType.OK:
+            try:
+                autoclose_min = int(entry_minutes.get_text().strip())
+            except ValueError:
+                autoclose_min = 10
 
-                    containers.append({
-                        "mapper": mapper,
-                        "image": img,
-                        "mount_point": actual_mount,
-                        "luks_locked": luks_locked,
-                        "fscrypt_folders": folders
-                    })
-        return json.dumps({"containers": containers})
+        dialog.destroy()
 
-    def OpenAll(self):
-        if not os.path.exists(CONFIG_FILE):
-            return 1
-        with open(CONFIG_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) < 4:
-                    continue
-                mapper, img, mount, _ = parts
-                self.MountImage(img, mapper, mount)
-        return 0
+        if self.proxy:
+            try:
+                code = self.proxy.UnlockFolder(fpath, method, key_file, autoclose_min)
+                if code != 0:
+                    print("Entsperren über D-Bus fehlgeschlagen.")
+            except Exception as e:
+                print(f"D-Bus Fehler: {e}")
 
-    def CloseAll(self):
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) < 4:
-                        continue
-                    mapper, _, mount, _ = parts
-                    subprocess.run(["umount", mount], capture_output=True)
-                    subprocess.run(["cryptsetup", "luksClose", mapper], capture_output=True)
-        return 0
-
-    def MountImage(self, img_path, mapper_name, mount_point):
-        if not os.path.exists(img_path):
-            return 1
-        # LUKS öffnen (ohne TTY übergeben wir stdin leer oder nutzen Standard)
-        res = subprocess.run(["cryptsetup", "status", mapper_name], capture_output=True)
-        if res.returncode != 0:
-            open_res = subprocess.run(["cryptsetup", "luksOpen", img_path, mapper_name], capture_output=True)
-            if open_res.returncode != 0:
-                return 1
-        
-        os.makedirs(mount_point, exist_ok=True)
-        mount_res = subprocess.run(["mount", f"/dev/mapper/{mapper_name}", mount_point], capture_output=True)
-        return mount_res.returncode
-
-    def UnlockFolder(self, target_dir, method, key_file, autoclose_min):
-        cmd = ["fscrypt", "unlock", "--quiet"]
-        if method == "raw_key" and key_file and os.path.exists(key_file):
-            cmd.append(f"--key={key_file}")
-        cmd.append(target_dir)
-
-        res = subprocess.run(cmd, capture_output=True)
-        if res.returncode != 0:
-            return 1
-
-        if autoclose_min > 0:
-            safe_name = target_dir.replace("/", "_")
-            timer_file = os.path.join(RUN_DIR, f"timer_{safe_name}")
-            import time
-            expire_epoch = int(time.time()) + (autoclose_min * 60)
-            with open(timer_file, "w") as tf:
-                tf.write(str(expire_epoch))
-
-            # Hintergrund-Timer starten
-            subprocess.Popen(f"sleep {autoclose_min * 60} && fscrypt lock '{target_dir}' && rm -f '{timer_file}'", shell=True)
-
-        return 0
-
-    def LockFolder(self, target_dir):
-        res = subprocess.run(["fscrypt", "lock", target_dir], capture_output=True)
-        safe_name = target_dir.replace("/", "_")
-        timer_file = os.path.join(RUN_DIR, f"timer_{safe_name}")
-        if os.path.exists(timer_file):
-            os.remove(timer_file)
-        return res.returncode
-
-if __name__ == "__main__":
-    bus = SystemBus()
-    bus.publish("org.fscrypt.Opener", FscryptOpenerService())
-    import glib
-    loop = glib.MainLoop()
-    loop.run()
+        self.refresh_status()
