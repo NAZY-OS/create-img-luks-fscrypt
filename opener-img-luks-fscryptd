@@ -22,8 +22,6 @@ cleanup() {
     local exit_code=$?
     log_info "Running cleanup..."
     
-    # If something failed midway before full setup completion, we can unmount/close if needed,
-    # or keep them active if intended. Here we ensure safe exit behavior.
     if [[ $exit_code -ne 0 ]]; then
         log_warn "Script exited with an error (code: $exit_code)."
     fi
@@ -41,7 +39,6 @@ create_default_config() {
 # Standard configuration for fscrypt-opener
 IMG_PATH=""
 MOUNT_POINT=""
-# Optional global or per-directory passwords/settings can be added here
 EOF
     fi
 }
@@ -59,8 +56,8 @@ load_config() {
             value=$(echo "$value" | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
             
             case "$key" in
-                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|ENCRYPT_*|FSCRYPT_PASSWORD_*)
-                    printf -v "$key" '%s' "$value"
+                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|FSCRYPT_PASSWORD_*)
+                    printf -v "$key" '%s' "$value" 2>/dev/null || true
                     ;;
             esac
         done < "$cfg"
@@ -79,7 +76,7 @@ parse_args() {
                 exit 0
                 ;;
             \?)
-                log_err "Unknown option: -$OPTARG"
+                log_err "Unrecognized option: -$OPTARG"
                 exit 1
                 ;;
             :)
@@ -169,34 +166,21 @@ api_mount_fs() {
     FS_MOUNTED=true
 }
 
-api_setup_fscrypt() {
-    local target_dir="$1"
-    log_info "Setting up fscrypt encryption for directory: $target_dir"
-    fscrypt setup --force || return 1
-    fscrypt encrypt "$target_dir" || return 1
-}
-
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
+    local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
     
     log_info "Unlocking fscrypt directory: $target_dir"
     
-    # Retrieve password from config/API variable if available, otherwise prompt securely
-    local pwd_var_name="FSCRYPT_PASSWORD_${rel_path//\//_}"
+    local pwd_var_name="FSCRYPT_PASSWORD_${safe_var_name}"
     local current_pwd="${!pwd_var_name:-}"
     
     if [[ -n "$current_pwd" ]]; then
-        log_info "Using password from configuration for '$rel_path'."
+        log_info "Using configured password for '$rel_path'."
         printf '%s' "$current_pwd" | fscrypt unlock "$target_dir" || return 1
     else
-        # Prompt user securely for password
-        if fscrypt unlock "$target_dir"; then
-            return 0
-        else
-            log_err "Failed to unlock $target_dir"
-            return 1
-        fi
+        fscrypt unlock "$target_dir" || return 1
     fi
 }
 
@@ -221,42 +205,22 @@ main() {
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$MOUNT_POINT/}"
             
-            if [[ -d "$dir/.fscrypt" ]]; then
-                log_info "Found existing fscrypt folder: $rel_path"
-                api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Skipping $rel_path due to unlock failure."; continue; }
-            else
-                log_warn "Directory '$rel_path' is not encrypted with fscrypt."
-                
-                local encrypt_var_name="ENCRYPT_${rel_path//\//_}"
-                local current_encrypt="${!encrypt_var_name:-}"
-                local do_encrypt=""
-
-                if [[ -n "$current_encrypt" ]]; then
-                    log_info "Encryption choice loaded from config for '$rel_path': $current_encrypt"
-                    do_encrypt="$current_encrypt"
-                else
-                    read -r -p "Would you like to encrypt '$rel_path' with fscrypt? [y/N]: " do_encrypt
-                fi
-
-                if [[ "$do_encrypt" =~ ^[Yy]$ ]]; then
-                    api_setup_fscrypt "$dir" || { log_err "Failed to setup fscrypt for $dir"; continue; }
-                    api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Failed to unlock newly encrypted $dir"; continue; }
-
-                    if [[ -z "$current_encrypt" ]]; then
-                        read -r -p "Save this encryption setting permanently in the config? [y/N]: " save_enc_cfg
-                        if [[ "$save_enc_cfg" =~ ^[Yy]$ ]]; then
-                            echo "ENCRYPT_${rel_path//\//_}='y'" >> "$CONFIG_FILE"
-                            log_info "Saved encryption setting to $CONFIG_FILE."
-                        fi
-                    fi
-                else
-                    log_info "Skipping encryption for '$rel_path'."
-                    continue
-                fi
+            # Skip system directories or non-fscrypt targets
+            if [[ "$rel_path" == "lost+found" || -z "$rel_path" ]]; then
+                continue
             fi
 
-            # Auto-Lock check
-            local config_var_name="AUTOLOCK_${rel_path//\//_}"
+            # Only process directories that are actually encrypted with fscrypt
+            if [[ -d "$dir/.fscrypt" ]]; then
+                log_info "Found encrypted fscrypt folder: $rel_path"
+                api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Skipping $rel_path due to unlock failure."; continue; }
+            else
+                log_info "Skipping unencrypted directory: $rel_path"
+                continue
+            fi
+
+            local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
+            local config_var_name="AUTOLOCK_${safe_var_name}"
             local current_auto_lock="${!config_var_name:-}"
             local auto_lock_min=""
 
@@ -277,7 +241,7 @@ main() {
                 if [[ -z "$current_auto_lock" ]]; then
                     read -r -p "Save this auto-lock value ($auto_lock_min min.) permanently in the config? [y/N]: " save_cfg
                     if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
-                        echo "AUTOLOCK_${rel_path//\//_}='$auto_lock_min'" >> "$CONFIG_FILE"
+                        echo "AUTOLOCK_${safe_var_name}='$auto_lock_min'" >> "$CONFIG_FILE"
                         log_info "Saved auto-lock setting to $CONFIG_FILE."
                     fi
                 fi
