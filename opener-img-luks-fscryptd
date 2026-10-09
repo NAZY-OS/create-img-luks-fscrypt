@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+NC=$'\033[0m'
+
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*" >&2; }
+log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
+
+CONFIG_FILE="/etc/fscrypt-opener.conf"
+IMG_PATH=""
+MOUNT_POINT=""
+MAPPER_NAME="secure_img_api_$$"
+
+# 1. Create standard config if it does not exist
+create_default_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_info "Creating default configuration at $CONFIG_FILE..."
+        cat << 'EOF' > "$CONFIG_FILE"
+# Standard configuration for fscrypt-opener
+IMG_PATH=""
+MOUNT_POINT=""
+EOF
+    fi
+}
+
+# 2. Safely load configuration (avoids arbitrary code execution via source)
+load_config() {
+    local cfg="$1"
+    if [[ -f "$cfg" ]]; then
+        log_info "Reading configuration securely from: $cfg"
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            
+            # Trim whitespace and surrounding quotes
+            key=$(echo "$key" | xargs)
+            value=$(echo "$value" | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+            
+            # Whitelist allowed configuration keys for security
+            case "$key" in
+                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|ENCRYPT_*)
+                    printf -v "$key" '%s' "$value"
+                    ;;
+            esac
+        done < "$cfg"
+    fi
+}
+
+# 3. Parse arguments via getopts
+parse_args() {
+    while getopts ":c:i:m:h" opt; do
+        case "$opt" in
+            c) CONFIG_FILE="$OPTARG" ;;
+            i) IMG_PATH="$OPTARG" ;;
+            m) MOUNT_POINT="$OPTARG" ;;
+            h)
+                echo "Usage: $0 [-c config] [-i image] [-m mountpoint]"
+                exit 0
+                ;;
+            \?)
+                log_err "Unknown option: -$OPTARG"
+                exit 1
+                ;;
+            :)
+                log_err "Option -$OPTARG requires an argument."
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# 4. Check system requirements (commands & kernel modules)
+check_system_requirements() {
+    if [[ $EUID -ne 0 ]]; then
+        log_err "This script must be executed with root privileges."
+        exit 1
+    fi
+
+    local required_commands=(cryptsetup mount umount fscrypt realpath modprobe lsmod mountpoint)
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log_err "Missing required command: $cmd"
+            exit 1
+        fi
+    done
+
+    local required_modules=(xts aes_generic ext4 dm_crypt)
+    for mod in "${required_modules[@]}"; do
+        if modprobe -n "$mod" >/dev/null 2>&1 && ! lsmod | grep -q "^$mod\b"; then
+            log_info "Loading kernel module: $mod"
+            modprobe "$mod" || { log_err "Failed to load module: $mod"; exit 1; }
+        fi
+    done
+}
+
+# 5. Validation and fallbacks (with error catching for bad configs)
+resolve_paths() {
+    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
+        log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
+        IMG_PATH=""
+    fi
+
+    if [[ -z "$IMG_PATH" ]]; then
+        read -r -p "Path to LUKS image (e.g., /secure/storage.img): " IMG_PATH
+    fi
+
+    if [[ -z "$IMG_PATH" || ! -f "$IMG_PATH" ]]; then
+        log_err "No valid image specified."
+        exit 1
+    fi
+
+    if [[ -n "$MOUNT_POINT" ]] && [[ ! -d "$MOUNT_POINT" ]]; then
+        log_warn "Configured mount point does not exist as a directory: $MOUNT_POINT (will be created)"
+    fi
+
+    if [[ -z "$MOUNT_POINT" ]]; then
+        read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
+    fi
+
+    if [[ -z "$MOUNT_POINT" ]]; then
+        log_err "No mount point specified."
+        exit 1
+    fi
+
+    IMG_PATH=$(realpath -m -- "$IMG_PATH")
+    MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
+}
+
+# --- API Functions ---
+api_open_luks() {
+    if ! cryptsetup status "$MAPPER_NAME" | grep -q "is active"; then
+        log_info "Opening LUKS volume: $IMG_PATH"
+        cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
+    else
+        log_info "LUKS volume is already open."
+    fi
+}
+
+api_mount_fs() {
+    if ! mountpoint -q -- "$MOUNT_POINT"; then
+        log_info "Mounting filesystem to $MOUNT_POINT"
+        mkdir -p -- "$MOUNT_POINT"
+        mount "/dev/mapper/$MAPPER_NAME" "$MOUNT_POINT" || return 1
+    else
+        log_info "Filesystem is already mounted."
+    fi
+}
+
+api_setup_fscrypt() {
+    local target_dir="$1"
+    log_info "Setting up fscrypt encryption for directory: $target_dir"
+    fscrypt setup --force || return 1
+    fscrypt encrypt "$target_dir" || return 1
+}
+
+api_decrypt_fscrypt() {
+    local target_dir="$1"
+    log_info "Unlocking fscrypt directory: $target_dir"
+    fscrypt unlock "$target_dir" || return 1
+}
+
+api_lock_fscrypt() {
+    local target_dir="$1"
+    log_info "Locking fscrypt directory automatically: $target_dir"
+    fscrypt lock "$target_dir"
+}
+
+# 6. Main Logic
+main() {
+    parse_args "$@"
+    create_default_config
+    load_config "$CONFIG_FILE"
+    check_system_requirements
+    resolve_paths
+
+    api_open_luks || exit 1
+    api_mount_fs || exit 1
+
+    if [[ -d "$MOUNT_POINT" ]]; then
+        while IFS= read -r -d '' dir; do
+            local rel_path="${dir#$MOUNT_POINT/}"
+            
+            # Check if fscrypt is already configured for this folder
+            if [[ -d "$dir/.fscrypt" ]]; then
+                log_info "Found existing fscrypt folder: $rel_path"
+                api_decrypt_fscrypt "$dir" || { log_err "Failed to unlock $rel_path"; continue; }
+            else
+                log_warn "Directory '$rel_path' is not encrypted with fscrypt."
+                
+                local encrypt_var_name="ENCRYPT_${rel_path//\//_}"
+                local current_encrypt="${!encrypt_var_name:-}"
+                local do_encrypt=""
+
+                if [[ -n "$current_encrypt" ]]; then
+                    log_info "Encryption choice loaded from config for '$rel_path': $current_encrypt"
+                    do_encrypt="$current_encrypt"
+                else
+                    read -r -p "Would you like to encrypt '$rel_path' with fscrypt? [y/N]: " do_encrypt
+                fi
+
+                if [[ "$do_encrypt" =~ ^[Yy]$ ]]; then
+                    api_setup_fscrypt "$dir" || { log_err "Failed to setup fscrypt for $dir"; continue; }
+                    api_decrypt_fscrypt "$dir" || { log_err "Failed to unlock newly encrypted $dir"; continue; }
+
+                    if [[ -z "$current_encrypt" ]]; then
+                        read -r -p "Save this encryption setting permanently in the config? [y/N]: " save_enc_cfg
+                        if [[ "$save_enc_cfg" =~ ^[Yy]$ ]]; then
+                            echo "ENCRYPT_${rel_path//\//_}='y'" >> "$CONFIG_FILE"
+                            log_info "Saved encryption setting to $CONFIG_FILE."
+                        fi
+                    fi
+                else
+                    log_info "Skipping encryption for '$rel_path'."
+                    continue
+                fi
+            fi
+
+            # Auto-Lock check
+            local config_var_name="AUTOLOCK_${rel_path//\//_}"
+            local current_auto_lock="${!config_var_name:-}"
+            local auto_lock_min=""
+
+            if [[ -n "$current_auto_lock" && "$current_auto_lock" =~ ^[0-9]+$ ]]; then
+                log_info "Auto-lock loaded from config for '$rel_path': $current_auto_lock minutes."
+                auto_lock_min="$current_auto_lock"
+            else
+                read -r -p "Auto-lock for '$rel_path' after X minutes (0 for no auto-lock): " auto_lock_min
+            fi
+
+            if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
+                (
+                    sleep "$(( auto_lock_min * 60 ))"
+                    api_lock_fscrypt "$dir"
+                ) &
+                log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
+
+                if [[ -z "$current_auto_lock" ]]; then
+                    read -r -p "Save this auto-lock value ($auto_lock_min min.) permanently in the config? [y/N]: " save_cfg
+                    if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
+                        echo "AUTOLOCK_${rel_path//\//_}='$auto_lock_min'" >> "$CONFIG_FILE"
+                        log_info "Saved auto-lock setting to $CONFIG_FILE."
+                    fi
+                fi
+            else
+                log_info "No auto-lock for '$rel_path' (remains open indefinitely)."
+            fi
+
+        done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
+    fi
+
+    log_info "Setup complete. LUKS and the mounted filesystem remain active."
+    exit 0
+}
+
+main "$@"
