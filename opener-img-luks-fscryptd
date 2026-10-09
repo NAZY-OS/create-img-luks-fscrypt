@@ -44,7 +44,6 @@ EOF
 load_config() {
     local cfg="$1"
     if [[ -f "$cfg" ]]; then
-        log_info "Reading configuration securely from: $cfg"
         while IFS='=' read -r key value; do
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
@@ -144,28 +143,22 @@ api_mount_fs() {
     return 0
 }
 
-# Accurate fscrypt check based on manual standards
 check_fscrypt_status() {
     local target_dir="$1"
-    
-    # Check if metadata directory exists or if status outputs valid policy info
     if [[ -d "$target_dir/.fscrypt" ]]; then
         return 0
     fi
-    
     local status_out
     status_out=$(fscrypt status "$target_dir" 2>&1 || true)
     if echo "$status_out" | grep -qiE "encrypted:\s*yes|policy:|not unlocked"; then
         return 0
     fi
-    
     return 1
 }
 
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
-    
     log_info "Unlocking fscrypt directory: $target_dir"
     fscrypt unlock "$target_dir" || {
         log_err "Failed to unlock fscrypt directory: $rel_path"
@@ -175,121 +168,114 @@ api_decrypt_fscrypt() {
 
 api_lock_fscrypt() {
     local target_dir="$1"
-    log_info "Locking fscrypt directory automatically: $target_dir"
+    log_info "locking fscrypt directory: $target_dir"
     fscrypt lock "$target_dir"
 }
 
-# --- STEP 2: Process fscrypt directories ---
-process_fscrypt_directories() {
-    if [[ ! -d "$MOUNT_POINT" ]]; then
-        log_err "Mount point is invalid: $MOUNT_POINT"
-        return 1
+# --- GUI JSON Status API ---
+api_output_json_status() {
+    local luks_locked=true
+    local mount_pt="N/A"
+    
+    if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
+        luks_locked=false
+        mount_pt=$(findmnt -n -o TARGET "/dev/mapper/$MAPPER_NAME" 2>/dev/null || echo "not_mounted")
     fi
-
-    log_info "Scanning subdirectories in $MOUNT_POINT..."
-    local target_dirs=()
-    while IFS= read -r -d '' dir; do
-        local rel_path="${dir#$MOUNT_POINT/}"
-        if [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] || [[ -z "$rel_path" ]]; then
-            continue
-        fi
-        target_dirs+=("$dir")
-    done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
-
-    for dir in "${target_dirs[@]}"; do
-        local rel_path="${dir#$MOUNT_POINT/}"
-        local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
-
-        if check_fscrypt_status "$dir"; then
-            log_info "Detected fscrypt-protected directory: $rel_path"
-            api_decrypt_fscrypt "$dir" "$rel_path" || continue
-        else
-            log_info "Directory '$rel_path' has no fscrypt policy configured. Skipping."
-            continue
-        fi
-
-        # Auto-Lock handling per folder
-        local config_var_name="AUTOLOCK_${safe_var_name}"
-        local current_auto_lock="${!config_var_name:-}"
-        local auto_lock_min=""
-
-        if [[ -n "$current_auto_lock" ]]; then
-            log_info "Auto-lock loaded from config for '$rel_path': $current_auto_lock minutes."
-            auto_lock_min="$current_auto_lock"
-        else
-            read -r -p "Auto-lock for '$rel_path' after X minutes (0 or empty for no auto-lock): " auto_lock_min
-        fi
-
-        if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
-            (
-                sleep "$(( auto_lock_min * 60 ))"
-                api_lock_fscrypt "$dir"
-            ) &
-            log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
-
-            if [[ -z "$current_auto_lock" ]]; then
-                read -r -p "Save this auto-lock value ($auto_lock_min min.) permanently in the config? [y/N]: " save_cfg
-                if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
-                    echo "AUTOLOCK_${safe_var_name}='$auto_lock_min'" >> "$CONFIG_FILE"
-                    log_info "Saved auto-lock setting to $CONFIG_FILE."
-                fi
+    
+    printf '{\n'
+    printf '  "luks_locked": %s,\n' "$luks_locked"
+    printf '  "mount_point": "%s",\n' "$mount_pt"
+    printf '  "fscrypt_folders": [\n'
+    
+    if [[ "$luks_locked" == "false" && "$mount_pt" != "not_mounted" && -d "$mount_pt" ]]; then
+        local first=true
+        while IFS= read -r -d '' dir; do
+            local rel_path="${dir#$mount_pt/}"
+            [[ "$rel_path" == "lost+found" || "$rel_path" =~ ^\. ]] && continue
+            
+            if check_fscrypt_status "$dir"; then
+                local locked=true
+                if ls "$dir" >/dev/null 2>&1; then locked=false; fi
+                
+                [[ "$first" == "true" ]] || printf ',\n'
+                printf '    {\n'
+                printf '      "name": "%s",\n' "$rel_path"
+                printf '      "locked": %s,\n' "$locked"
+                printf '      "remaining_time_sec": 999\n'
+                printf '    }'
+                first=false
             fi
-        else
-            log_info "No auto-lock configured for '$rel_path'."
-        fi
-    done
-    return 0
+        done < <(find "$mount_pt" -mindepth 1 -maxdepth 1 -type d -print0)
+    fi
+    
+    printf '\n  ]\n'
+    printf '}\n'
 }
 
-# 6. Main Logic (Procedural Flow)
+api_save_setting() {
+    local key="$1"
+    local value="$2"
+    if [[ -n "$key" && -n "$value" ]]; then
+        echo "${key}='${value}'" >> "$CONFIG_FILE"
+        log_info "Saved setting $key=$value to $CONFIG_FILE"
+    fi
+}
+
+api_close_all() {
+    load_config "$CONFIG_FILE"
+    if [[ -n "$MOUNT_POINT" ]] && mountpoint -q -- "$MOUNT_POINT"; then
+        umount "$MOUNT_POINT" || true
+    fi
+    if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
+        cryptsetup luksClose "$MAPPER_NAME" || true
+    fi
+    log_info "Container closed successfully."
+}
+
+# --- Main Logic (Procedural Flow) ---
 main() {
-    parse_args "$@" || return 1
     create_default_config
     load_config "$CONFIG_FILE"
+
+    # Handle API requests from Python GUI
+    case "${1:-}" in
+        api_status)
+            api_output_json_status
+            exit 0
+            ;;
+        api_open)
+            check_system_requirements || exit 1
+            resolve_paths || exit 1
+            api_open_luks || exit 1
+            if [[ -z "$MOUNT_POINT" ]]; then
+                MOUNT_POINT="/mnt/secure"
+            fi
+            api_mount_fs || exit 1
+            exit 0
+            ;;
+        api_close)
+            check_system_requirements || exit 1
+            api_close_all
+            exit 0
+            ;;
+        api_save_setting)
+            api_save_setting "$2" "$3"
+            exit 0
+            ;;
+    esac
+
+    # Fallback to standard CLI interactive flow if run directly
+    parse_args "$@" || return 1
     check_system_requirements || return 1
     resolve_paths || return 1
-
-    # Step 1: Open LUKS & Check mount point reuse
     api_open_luks || { log_err "Failed to open LUKS container."; return 1; }
-
-    local existing_mount=""
-    existing_mount=$(findmnt -n -o TARGET "/dev/mapper/$MAPPER_NAME" 2>/dev/null || true)
-
-    if [[ -n "$existing_mount" ]]; then
-        log_info "LUKS mapper is already mounted at: $existing_mount"
-        echo "1) Reuse existing mount point ($existing_mount)"
-        echo "2) Specify a new mount point"
-        read -r -p "Choose option [1/2] (default 1): " mount_choice
-        mount_choice="${mount_choice:-1}"
-
-        if [[ "$mount_choice" == "2" ]]; then
-            read -r -p "New mount point: " MOUNT_POINT
-            if [[ -z "$MOUNT_POINT" ]]; then
-                log_err "No mount point provided."
-                return 1
-            fi
-            MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
-            api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
-        else
-            MOUNT_POINT="$existing_mount"
-            log_info "Reusing existing mount point. Jumping directly to Step 2..."
-        fi
-    else
-        if [[ -z "$MOUNT_POINT" ]]; then
-            read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
-        fi
-        if [[ -z "$MOUNT_POINT" ]]; then
-            log_err "No mount point provided."
-            return 1
-        fi
-        MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
-        api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
+    
+    if [[ -z "$MOUNT_POINT" ]]; then
+        read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
     fi
+    MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
+    api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
 
-    # Step 2: Process fscrypt directories
-    process_fscrypt_directories || { log_warn "Encountered issues while processing fscrypt folders."; }
-
-    log_info "Setup complete."
     return 0
 }
 
