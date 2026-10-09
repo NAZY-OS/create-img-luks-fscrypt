@@ -132,27 +132,35 @@ api_decrypt_fscrypt() {
     local rel_path="$2"
     log_info "Unlocking fscrypt directory: $target_dir"
 
-    if fscrypt unlock "$target_dir"; then
-        local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
-        local config_var_name="AUTOLOCK_${safe_var_name}"
-        local auto_lock_min="${!config_var_name:-${DEFAULT_AUTOLOCK:-10}}"
-
-        if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
-            local expire_epoch=$(( $(date +%s) + (auto_lock_min * 60) ))
-            echo "$expire_epoch" > "$RUN_DIR/timer_${safe_var_name}"
-            
-            (
-                sleep "$(( auto_lock_min * 60 ))"
-                fscrypt lock "$target_dir"
-                rm -f "$RUN_DIR/timer_${safe_var_name}"
-            ) &
-            log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
+    # Verhindert Endlosschleifen bei Fehleingaben über --quiet oder tty-Check
+    if [[ -t 0 ]]; then
+        if ! fscrypt unlock "$target_dir"; then
+            log_err "Failed to unlock fscrypt directory: $rel_path (Incorrect passphrase or aborted)"
+            return 1
         fi
-        return 0
     else
-        log_err "Failed to unlock fscrypt directory: $rel_path (Aborted or incorrect passphrase)"
-        return 1
+        if ! fscrypt unlock --quiet "$target_dir"; then
+            log_err "Failed to unlock fscrypt directory: $rel_path (Incorrect passphrase or aborted)"
+            return 1
+        fi
     fi
+
+    local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
+    local config_var_name="AUTOLOCK_${safe_var_name}"
+    local auto_lock_min="${!config_var_name:-${DEFAULT_AUTOLOCK:-10}}"
+
+    if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
+        local expire_epoch=$(( $(date +%s) + (auto_lock_min * 60) ))
+        echo "$expire_epoch" > "$RUN_DIR/timer_${safe_var_name}"
+        
+        (
+            sleep "$(( auto_lock_min * 60 ))"
+            fscrypt lock "$target_dir"
+            rm -f "$RUN_DIR/timer_${safe_var_name}"
+        ) &
+        log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
+    fi
+    return 0
 }
 
 api_lock_fscrypt() {
