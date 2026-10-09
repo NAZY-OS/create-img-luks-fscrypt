@@ -1,0 +1,13 @@
+[Unit]
+Description=Fscrypt and LUKS Multi-Container Opener D-Bus Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fscrypt-opener-service.py
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
