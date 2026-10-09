@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Fscrypt Tray Control
+Comment=System tray indicator for secure encrypted units and fscrypt folders
+Exec=/usr/local/bin/fscrypt_tray.py
+Terminal=false
+Categories=Utility;Security;
+X-GNOME-Autostart-enabled=true
