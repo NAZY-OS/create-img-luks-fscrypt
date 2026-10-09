@@ -14,6 +14,24 @@ CONFIG_FILE="/etc/fscrypt-opener.conf"
 IMG_PATH=""
 MOUNT_POINT=""
 MAPPER_NAME="secure_img_api_$$"
+LUKS_OPENED=false
+FS_MOUNTED=false
+
+# --- Cleanup & Trap ---
+cleanup() {
+    local exit_code=$?
+    log_info "Running cleanup..."
+    
+    # If something failed midway before full setup completion, we can unmount/close if needed,
+    # or keep them active if intended. Here we ensure safe exit behavior.
+    if [[ $exit_code -ne 0 ]]; then
+        log_warn "Script exited with an error (code: $exit_code)."
+    fi
+    
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
 
 # 1. Create standard config if it does not exist
 create_default_config() {
@@ -23,27 +41,25 @@ create_default_config() {
 # Standard configuration for fscrypt-opener
 IMG_PATH=""
 MOUNT_POINT=""
+# Optional global or per-directory passwords/settings can be added here
 EOF
     fi
 }
 
-# 2. Safely load configuration (avoids arbitrary code execution via source)
+# 2. Safely load configuration
 load_config() {
     local cfg="$1"
     if [[ -f "$cfg" ]]; then
         log_info "Reading configuration securely from: $cfg"
         while IFS='=' read -r key value; do
-            # Skip comments and empty lines
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
             
-            # Trim whitespace and surrounding quotes
             key=$(echo "$key" | xargs)
             value=$(echo "$value" | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
             
-            # Whitelist allowed configuration keys for security
             case "$key" in
-                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|ENCRYPT_*)
+                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|ENCRYPT_*|FSCRYPT_PASSWORD_*)
                     printf -v "$key" '%s' "$value"
                     ;;
             esac
@@ -74,7 +90,7 @@ parse_args() {
     done
 }
 
-# 4. Check system requirements (commands & kernel modules)
+# 4. Check system requirements
 check_system_requirements() {
     if [[ $EUID -ne 0 ]]; then
         log_err "This script must be executed with root privileges."
@@ -98,7 +114,7 @@ check_system_requirements() {
     done
 }
 
-# 5. Validation and fallbacks (with error catching for bad configs)
+# 5. Validation and fallbacks
 resolve_paths() {
     if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
         log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
@@ -139,6 +155,7 @@ api_open_luks() {
     else
         log_info "LUKS volume is already open."
     fi
+    LUKS_OPENED=true
 }
 
 api_mount_fs() {
@@ -149,6 +166,7 @@ api_mount_fs() {
     else
         log_info "Filesystem is already mounted."
     fi
+    FS_MOUNTED=true
 }
 
 api_setup_fscrypt() {
@@ -160,8 +178,26 @@ api_setup_fscrypt() {
 
 api_decrypt_fscrypt() {
     local target_dir="$1"
+    local rel_path="$2"
+    
     log_info "Unlocking fscrypt directory: $target_dir"
-    fscrypt unlock "$target_dir" || return 1
+    
+    # Retrieve password from config/API variable if available, otherwise prompt securely
+    local pwd_var_name="FSCRYPT_PASSWORD_${rel_path//\//_}"
+    local current_pwd="${!pwd_var_name:-}"
+    
+    if [[ -n "$current_pwd" ]]; then
+        log_info "Using password from configuration for '$rel_path'."
+        printf '%s' "$current_pwd" | fscrypt unlock "$target_dir" || return 1
+    else
+        # Prompt user securely for password
+        if fscrypt unlock "$target_dir"; then
+            return 0
+        else
+            log_err "Failed to unlock $target_dir"
+            return 1
+        fi
+    fi
 }
 
 api_lock_fscrypt() {
@@ -185,10 +221,9 @@ main() {
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$MOUNT_POINT/}"
             
-            # Check if fscrypt is already configured for this folder
             if [[ -d "$dir/.fscrypt" ]]; then
                 log_info "Found existing fscrypt folder: $rel_path"
-                api_decrypt_fscrypt "$dir" || { log_err "Failed to unlock $rel_path"; continue; }
+                api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Skipping $rel_path due to unlock failure."; continue; }
             else
                 log_warn "Directory '$rel_path' is not encrypted with fscrypt."
                 
@@ -205,7 +240,7 @@ main() {
 
                 if [[ "$do_encrypt" =~ ^[Yy]$ ]]; then
                     api_setup_fscrypt "$dir" || { log_err "Failed to setup fscrypt for $dir"; continue; }
-                    api_decrypt_fscrypt "$dir" || { log_err "Failed to unlock newly encrypted $dir"; continue; }
+                    api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Failed to unlock newly encrypted $dir"; continue; }
 
                     if [[ -z "$current_encrypt" ]]; then
                         read -r -p "Save this encryption setting permanently in the config? [y/N]: " save_enc_cfg
