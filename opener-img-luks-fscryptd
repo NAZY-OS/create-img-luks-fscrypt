@@ -41,7 +41,6 @@ MOUNT_POINT=""
 DEFAULT_AUTOLOCK="10"
 EOF
     fi
-    # Robust ensure /run runtime directory exists with proper permissions
     mkdir -p "$RUN_DIR" 2>/dev/null || true
     chmod 755 "$RUN_DIR" 2>/dev/null || true
 }
@@ -69,7 +68,7 @@ check_system_requirements() {
     if (( EUID != 0 )); then
         log_err "This script must be executed with root privileges."
         return 1
-    }
+    fi
 
     local required_commands=(cryptsetup mount umount fscrypt realpath mountpoint findmnt)
     for cmd in "${required_commands[@]}"; do
@@ -133,7 +132,6 @@ api_decrypt_fscrypt() {
     local rel_path="$2"
     log_info "Unlocking fscrypt directory: $target_dir"
 
-    # Correct argument count for fscrypt unlock (expects target directory only)
     if fscrypt unlock "$target_dir"; then
         local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
         local config_var_name="AUTOLOCK_${safe_var_name}"
