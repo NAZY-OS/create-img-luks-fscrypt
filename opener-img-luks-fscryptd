@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# fscrypt-opener backend (Strict API & CLI Separation)
+# fscrypt-opener backend (Strict API/Daemon & Interactive CLI)
 # Licensed under GNU GPL v3
 
 set -uo pipefail
@@ -101,7 +101,12 @@ api_open_luks() {
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
         return 0
     else
-        cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
+        # Liest das Passwort sicher über Stdin (von GUI übergeben) oder nutzt system Pinentry
+        if [ -t 0 ]; then
+            cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
+        else
+            cryptsetup luksOpen --key-file - "$IMG_PATH" "$MAPPER_NAME" || return 1
+        fi
     fi
 }
 
@@ -127,17 +132,10 @@ api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
     
-    local passphrase=""
-    if command -v zenity >/dev/null 2>&1; then
-        passphrase=$(zenity --password --title="Fscrypt Unlock" --text="Enter passphrase for $rel_path:" 2>/dev/null || true)
-    elif command -v kdialog >/dev/null 2>&1; then
-        passphrase=$(kdialog --password "Enter passphrase for $rel_path:" 2>/dev/null || true)
-    fi
-
-    if [[ -n "$passphrase" ]]; then
-        echo "$passphrase" | fscrypt unlock "$target_dir" --unlock-with-passphrase || return 1
-    else
+    if [ -t 0 ]; then
         fscrypt unlock "$target_dir" || return 1
+    else
+        fscrypt unlock "$target_dir" --unlock-with-passphrase || return 1
     fi
 
     local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
@@ -288,12 +286,12 @@ handle_api() {
             exit 0
             ;;
         *)
-            return 1 # Fall back to interactive CLI if no known API command matches
+            return 1
             ;;
     esac
 }
 
-# --- Interactive CLI Mode (Only runs when called manually without API args) ---
+# --- Interactive CLI Mode ---
 run_interactive_cli() {
     create_default_config
     
@@ -335,7 +333,6 @@ run_interactive_cli() {
     
     api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
 
-    # Interactive fscrypt processing
     if [[ -d "$MOUNT_POINT" ]]; then
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$MOUNT_POINT/}"
@@ -351,9 +348,7 @@ run_interactive_cli() {
     return 0
 }
 
-# --- Main Entry Point ---
 main() {
-    # Try handling as API call first. If it returns 1 (unknown command), run interactive CLI.
     if handle_api "${1:-}" "$@"; then
         exit 0
     else
