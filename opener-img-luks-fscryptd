@@ -26,22 +26,21 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# 1. Create standard config if not present
+# 1. Create standard config if not present (No passwords!)
 create_default_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_info "Creating default configuration at $CONFIG_FILE..."
         cat << 'EOF' > "$CONFIG_FILE"
-# Standard configuration for fscrypt-opener
+# Standard configuration for fscrypt-opener (No passwords allowed here)
 IMG_PATH=""
 MOUNT_POINT=""
-# Examples for API / Daemon config:
-# FSCRYPT_PASSWORD_myfolder="your_password"
+# Example Auto-lock configuration per folder:
 # AUTOLOCK_myfolder="10"
 EOF
     fi
 }
 
-# 2. Safely load configuration
+# 2. Safely load configuration (Excluding passwords)
 load_config() {
     local cfg="$1"
     if [[ -f "$cfg" ]]; then
@@ -54,8 +53,8 @@ load_config() {
             value=$(echo "$value" | xargs | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
             
             case "$key" in
-                IMG_PATH|MOUNT_POINT|AUTOLOCK_*|FSCRYPT_PASSWORD_*)
-                    printf -v "$key" '\%s' "$value" 2>/dev/null || true
+                IMG_PATH|MOUNT_POINT|AUTOLOCK_*)
+                    printf -v "$key" '%s' "$value" 2>/dev/null || true
                     ;;
             esac
         done < "$cfg"
@@ -83,6 +82,7 @@ parse_args() {
                 ;;
         esac
     done
+    return 0
 }
 
 # 4. Check system requirements
@@ -92,7 +92,7 @@ check_system_requirements() {
         return 1
     fi
 
-    local required_commands=(cryptsetup mount umount fscrypt realpath modprobe lsmod mountpoint)
+    local required_commands=(cryptsetup mount umount fscrypt realpath modprobe lsmod mountpoint findmnt)
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             log_err "Missing required command: $cmd"
@@ -102,7 +102,7 @@ check_system_requirements() {
 
     local required_modules=(xts aes_generic ext4 dm_crypt)
     for mod in "${required_modules[@]}"; do
-        if modprobe -n "$mod" >/dev/null 2>&1 && ! lsmod \vert{} grep -q "^$mod\b"; then
+        if modprobe -n "$mod" >/dev/null 2>&1 && ! lsmod | grep -q "^$mod\b"; then
             log_info "Loading kernel module: $mod"
             modprobe "$mod" || { log_err "Failed to load module: $mod"; return 1; }
         fi
@@ -110,9 +110,9 @@ check_system_requirements() {
     return 0
 }
 
-# 5. Validation and fallbacks
+# 5. Path validation
 resolve_paths() {
-    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] \vert{}\vert{} [[ ! -r "$IMG_PATH" ]]; }; then
+    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
         log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
         IMG_PATH=""
     fi
@@ -121,7 +121,7 @@ resolve_paths() {
         read -r -p "Path to LUKS image (e.g., /secure/storage.img): " IMG_PATH
     fi
 
-    if [[ -z "$IMG_PATH" \vert{}\vert{} ! -f "$IMG_PATH" ]]; then
+    if [[ -z "$IMG_PATH" || ! -f "$IMG_PATH" ]]; then
         log_err "No valid image specified."
         return 1
     fi
@@ -130,7 +130,7 @@ resolve_paths() {
     return 0
 }
 
-# --- API Functions (Daemon Ready) ---
+# --- API Functions (Daemon & API Ready) ---
 api_open_luks() {
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
         log_info "LUKS volume '$MAPPER_NAME' is already open and active."
@@ -152,14 +152,9 @@ api_mount_fs() {
     return 0
 }
 
-# Reliable check using fscrypt status text patterns
-is_fscrypt_dir() {
+is_fscrypt_encrypted_dir() {
     local target_dir="$1"
-    local status_output
-    status_output=$(fscrypt status "$target_dir" 2>/dev/null || true)
-    
-    # Check if fscrypt identifies it as an encrypted directory or policy-enabled directory
-    if echo "$status_output" | grep -qiE "encrypted:\s*yes|policy:"; then
+    if fscrypt status "$target_dir" 2>/dev/null | grep -qiE "encrypted:\s*yes|policy:"; then
         return 0
     fi
     return 1
@@ -168,19 +163,10 @@ is_fscrypt_dir() {
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
-    local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
     
-    log_info "Unlocking fscrypt directory: $target_dir"
-    
-    local pwd_var_name="FSCRYPT_PASSWORD_${safe_var_name}"
-    local current_pwd="${!pwd_var_name:-}"
-    
-    if [[ -n "$current_pwd" ]]; then
-        log_info "Using configured password from config/API for '$rel_path'."
-        printf '%s' "$current_pwd" | fscrypt unlock "$target_dir" || return 1
-    else
-        fscrypt unlock "$target_dir" || return 1
-    fi
+    log_info "Unlocking fscrypt directory interactively: $target_dir"
+    # fscrypt handles its own secure password prompt natively per directory
+    fscrypt unlock "$target_dir" || return 1
 }
 
 api_lock_fscrypt() {
@@ -192,16 +178,15 @@ api_lock_fscrypt() {
 # --- STEP 2: Process fscrypt directories ---
 process_fscrypt_directories() {
     if [[ ! -d "$MOUNT_POINT" ]]; then
-        log_err "Mount point does not exist or is invalid: $MOUNT_POINT"
+        log_err "Mount point is invalid: $MOUNT_POINT"
         return 1
     fi
 
-    log_info "Scanning top-level directories in $MOUNT_POINT for fscrypt configuration..."
+    log_info "Scanning subdirectories in $MOUNT_POINT..."
     local target_dirs=()
     while IFS= read -r -d '' dir; do
         local rel_path="${dir#$MOUNT_POINT/}"
-        # Skip system or metadata directories
-        if [[ "$rel_path" == "lost+found" \vert{}\vert{} "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] \vert{}\vert{} [[ -z "$rel_path" ]]; then
+        if [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] || [[ -z "$rel_path" ]]; then
             continue
         fi
         target_dirs+=("$dir")
@@ -211,14 +196,14 @@ process_fscrypt_directories() {
         local rel_path="${dir#$MOUNT_POINT/}"
         local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
 
-        if is_fscrypt_dir "$dir"; then
-            log_info "Found encrypted fscrypt folder: $rel_path"
+        if is_fscrypt_encrypted_dir "$dir"; then
+            log_info "Found valid fscrypt directory: $rel_path"
             api_decrypt_fscrypt "$dir" "$rel_path" || {
-                log_warn "Failed to unlock $rel_path. Continuing with other folders."
+                log_warn "Could not unlock '$rel_path'. Skipping this folder."
                 continue
             }
         else
-            log_info "Folder '$rel_path' is not an fscrypt directory. Skipping unlock."
+            log_info "Folder '$rel_path' has no fscrypt encryption policy. Skipping."
             continue
         fi
 
@@ -228,7 +213,7 @@ process_fscrypt_directories() {
         local auto_lock_min=""
 
         if [[ -n "$current_auto_lock" ]]; then
-            log_info "Auto-lock loaded from config for '$rel_path':$current_auto_lock minutes."
+            log_info "Auto-lock loaded from config for '$rel_path': $current_auto_lock minutes."
             auto_lock_min="$current_auto_lock"
         else
             read -r -p "Auto-lock for '$rel_path' after X minutes (0 or empty for no auto-lock): " auto_lock_min
@@ -239,7 +224,7 @@ process_fscrypt_directories() {
                 sleep "$(( auto_lock_min * 60 ))"
                 api_lock_fscrypt "$dir"
             ) &
-            log_info "Auto-timer for '$rel_path' started: locking in$auto_lock_min minutes."
+            log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
 
             if [[ -z "$current_auto_lock" ]]; then
                 read -r -p "Save this auto-lock value ($auto_lock_min min.) permanently in the config? [y/N]: " save_cfg
@@ -249,13 +234,13 @@ process_fscrypt_directories() {
                 fi
             fi
         else
-            log_info "No auto-lock configured for '$rel_path' (remains open indefinitely)."
+            log_info "No auto-lock configured for '$rel_path' (remains open)."
         fi
     done
     return 0
 }
 
-# 6. Main Logic
+# 6. Main Logic (Procedural Flow)
 main() {
     parse_args "$@" || return 1
     create_default_config
@@ -263,37 +248,37 @@ main() {
     check_system_requirements || return 1
     resolve_paths || return 1
 
-    api_open_luks || { log_err "Failed to open LUKS volume."; return 1; }
+    # Step 1: Open LUKS & check mount point reuse
+    api_open_luks || { log_err "Failed to open LUKS container."; return 1; }
 
-    # Check if mapper is already mounted
     local existing_mount=""
     existing_mount=$(findmnt -n -o TARGET "/dev/mapper/$MAPPER_NAME" 2>/dev/null || true)
 
     if [[ -n "$existing_mount" ]]; then
-        log_info "LUKS volume is already mounted at: $existing_mount"
+        log_info "LUKS mapper is already mounted at: $existing_mount"
         echo "1) Reuse existing mount point ($existing_mount)"
         echo "2) Specify a new mount point"
-        read -r -p "Choose an option [1/2] (default 1): " mount_choice
+        read -r -p "Choose option [1/2] (default 1): " mount_choice
         mount_choice="${mount_choice:-1}"
 
         if [[ "$mount_choice" == "2" ]]; then
-            read -r -p "New mount point (e.g., /mnt/secure): " MOUNT_POINT
+            read -r -p "New mount point: " MOUNT_POINT
             if [[ -z "$MOUNT_POINT" ]]; then
-                log_err "No mount point specified."
+                log_err "No mount point provided."
                 return 1
             fi
             MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
             api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
         else
             MOUNT_POINT="$existing_mount"
-            log_info "Reusing existing mount point. Jumping directly to Step 2 (fscrypt)..."
+            log_info "Reusing existing mount point. Jumping directly to Step 2 (fscrypt processing)..."
         fi
     else
         if [[ -z "$MOUNT_POINT" ]]; then
             read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
         fi
         if [[ -z "$MOUNT_POINT" ]]; then
-            log_err "No mount point specified."
+            log_err "No mount point provided."
             return 1
         fi
         MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
@@ -301,6 +286,10 @@ main() {
     fi
 
     # Step 2: Process fscrypt directories
-    process_fscrypt_directories
+    process_fscrypt_directories || { log_warn "Encountered issues while processing fscrypt folders."; }
 
-    log_info "Setup complete. LUKS and the mounted filesystem remain active."
+    log_info "Setup complete. LUKS volume and target folders remain active."
+    return 0
+}
+
+main "$@"
