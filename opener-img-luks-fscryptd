@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# fscrypt-opener backend (Interactive CLI + GUI API)
+# fscrypt-opener backend (Strict API & CLI Separation)
 # Licensed under GNU GPL v3
 
 set -uo pipefail
@@ -31,7 +31,6 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# 1. Create standard config if not present
 create_default_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_info "Creating default configuration at $CONFIG_FILE..."
@@ -46,19 +45,9 @@ EOF
     chmod 755 "$RUN_DIR" 2>/dev/null || true
 }
 
-# 2. Safely load configuration and print current values on startup
 load_config() {
     local cfg="$1"
     if [[ -f "$cfg" ]]; then
-        log_info "Reading configuration from: $cfg"
-        echo "=== Current Configuration Contents ==="
-        while IFS= read -r line; do
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            [[ -z "${line// }" ]] && continue
-            echo "  $line"
-        done < "$cfg"
-        echo "======================================"
-
         while IFS='=' read -r key value; do
             [[ "$key" =~ ^[[:space:]]*# ]] && continue
             [[ -z "$key" ]] && continue
@@ -75,32 +64,6 @@ load_config() {
     fi
 }
 
-# 3. Parse arguments via getopts (CLI Mode)
-parse_args() {
-    while getopts ":c:i:m:h" opt; do
-        case "$opt" in
-            c) CONFIG_FILE="$OPTARG" ;;
-            i) IMG_PATH="$OPTARG" ;;
-            m) MOUNT_POINT="$OPTARG" ;;
-            h)
-                echo "Usage: $0 [-c config] [-i image] [-m mountpoint]"
-                echo "       $0 api_status | api_open | api_close"
-                exit 0
-                ;;
-            \?)
-                log_err "Unrecognized option: -$OPTARG"
-                return 1
-                ;;
-            :)
-                log_err "Option -$OPTARG requires an argument."
-                return 1
-                ;;
-        esac
-    done
-    return 0
-}
-
-# 4. Check system requirements
 check_system_requirements() {
     if [[ $EUID -ne 0 ]]; then
         log_err "This script must be executed with root privileges."
@@ -117,7 +80,6 @@ check_system_requirements() {
     return 0
 }
 
-# 5. Path validation and interactive fallbacks
 resolve_paths() {
     if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
         log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
@@ -125,36 +87,28 @@ resolve_paths() {
     fi
 
     if [[ -z "$IMG_PATH" ]]; then
-        read -r -p "Path to LUKS image (e.g., /secure/storage.img): " IMG_PATH
-    fi
-
-    if [[ -z "$IMG_PATH" || ! -f "$IMG_PATH" ]]; then
-        log_err "No valid image specified."
+        log_err "No valid image specified in config."
         return 1
     fi
 
     IMG_PATH=$(realpath -m -- "$IMG_PATH")
+    [[ -z "$MOUNT_POINT" ]] && MOUNT_POINT="/mnt/secure"
+    MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
     return 0
 }
 
-# --- Core LUKS & Mount Functions ---
 api_open_luks() {
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
-        log_info "LUKS volume '$MAPPER_NAME' is already open and active."
         return 0
     else
-        log_info "Opening LUKS volume: $IMG_PATH"
         cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
     fi
 }
 
 api_mount_fs() {
     if ! mountpoint -q -- "$MOUNT_POINT"; then
-        log_info "Mounting filesystem to $MOUNT_POINT"
         mkdir -p -- "$MOUNT_POINT"
         mount "/dev/mapper/$MAPPER_NAME" "$MOUNT_POINT" || return 1
-    else
-        log_info "Filesystem is already mounted at $MOUNT_POINT."
     fi
     return 0
 }
@@ -172,7 +126,6 @@ check_fscrypt_status() {
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
-    log_info "Unlocking fscrypt directory: $target_dir"
     
     local passphrase=""
     if command -v zenity >/dev/null 2>&1; then
@@ -200,7 +153,6 @@ api_decrypt_fscrypt() {
             fscrypt lock "$target_dir"
             rm -f "$RUN_DIR/timer_${safe_var_name}"
         ) &
-        log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
     fi
 }
 
@@ -212,60 +164,6 @@ api_lock_fscrypt() {
     rm -f "$RUN_DIR/timer_${safe_name}"
 }
 
-# --- Interactive CLI fscrypt processing ---
-process_fscrypt_directories() {
-    if [[ ! -d "$MOUNT_POINT" ]]; then
-        log_err "Mount point is invalid: $MOUNT_POINT"
-        return 1
-    fi
-
-    log_info "Scanning subdirectories in $MOUNT_POINT..."
-    local target_dirs=()
-    while IFS= read -r -d '' dir; do
-        local rel_path="${dir#$MOUNT_POINT/}"
-        if [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] || [[ -z "$rel_path" ]]; then
-            continue
-        fi
-        target_dirs+=("$dir")
-    done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
-
-    for dir in "${target_dirs[@]}"; do
-        local rel_path="${dir#$MOUNT_POINT/}"
-        local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
-
-        if check_fscrypt_status "$dir"; then
-            log_info "Detected fscrypt-protected directory: $rel_path"
-            api_decrypt_fscrypt "$dir" "$rel_path" || continue
-        else
-            log_info "Directory '$rel_path' has no fscrypt policy configured. Skipping."
-            continue
-        fi
-
-        local config_var_name="AUTOLOCK_${safe_var_name}"
-        local current_auto_lock="${!config_var_name:-}"
-        local auto_lock_min=""
-
-        if [[ -n "$current_auto_lock" ]]; then
-            log_info "Auto-lock loaded from config for '$rel_path': $current_auto_lock minutes."
-            auto_lock_min="$current_auto_lock"
-        else
-            read -r -p "Auto-lock for '$rel_path' after X minutes (0 or empty for no auto-lock): " auto_lock_min
-        fi
-
-        if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
-            if [[ -z "$current_auto_lock" ]]; then
-                read -r -p "Save this auto-lock value ($auto_lock_min min.) permanently in the config? [y/N]: " save_cfg
-                if [[ "$save_cfg" =~ ^[Yy]$ ]]; then
-                    echo "AUTOLOCK_${safe_var_name}='$auto_lock_min'" >> "$CONFIG_FILE"
-                    log_info "Saved auto-lock setting to $CONFIG_FILE."
-                fi
-            fi
-        fi
-    done
-    return 0
-}
-
-# --- GUI API JSON Status Output ---
 api_output_json_status() {
     local luks_locked=true
     local mount_pt="N/A"
@@ -321,7 +219,7 @@ api_save_setting() {
     local value="$2"
     if [[ -n "$key" && -n "$value" ]]; then
         echo "${key}='${value}'" >> "$CONFIG_FILE"
-        log_info "Saved setting $key=$value to $CONFIG_FILE"
+        log_info "Saved setting $key=$value"
     fi
 }
 
@@ -337,12 +235,11 @@ api_close_all() {
     log_info "Container closed successfully."
 }
 
-# --- Main Flow ---
-main() {
+# --- Strict API & Daemon Router ---
+handle_api() {
     create_default_config
     load_config "$CONFIG_FILE"
 
-    # 1. Handle API Requests from Python GUI if specified as first argument
     case "${1:-}" in
         api_status)
             api_output_json_status
@@ -352,8 +249,6 @@ main() {
             check_system_requirements || exit 1
             resolve_paths || exit 1
             api_open_luks || exit 1
-            [[ -z "$MOUNT_POINT" ]] && MOUNT_POINT="/mnt/secure"
-            MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
             api_mount_fs || exit 1
             exit 0
             ;;
@@ -380,30 +275,90 @@ main() {
             api_save_setting "$2" "$3"
             exit 0
             ;;
+        daemon)
+            check_system_requirements || exit 1
+            log_info "Daemon running in background..."
+            while true; do sleep 30; done
+            exit 0
+            ;;
+        -h|--help)
+            echo "Usage: $0 [API_COMMAND] [ARGS...]"
+            echo "API Commands: api_status, api_open, api_close, api_unlock_folder <name>, api_lock_folder <name>, api_save_setting <key> <val>, daemon"
+            echo "Run without parameters for interactive CLI mode."
+            exit 0
+            ;;
+        *)
+            return 1 # Fall back to interactive CLI if no known API command matches
+            ;;
     esac
+}
 
-    # 2. Otherwise, run the classic Interactive CLI Flow
-    parse_args "$@" || return 1
+# --- Interactive CLI Mode (Only runs when called manually without API args) ---
+run_interactive_cli() {
+    create_default_config
+    
+    echo "=== Current Configuration Contents ==="
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cat "$CONFIG_FILE"
+    fi
+    echo "======================================"
+
+    load_config "$CONFIG_FILE"
+
+    while getopts ":c:i:m:h" opt; do
+        case "$opt" in
+            c) CONFIG_FILE="$OPTARG" ;;
+            i) IMG_PATH="$OPTARG" ;;
+            m) MOUNT_POINT="$OPTARG" ;;
+            h)
+                echo "Usage: $0 [-c config] [-i image] [-m mountpoint]"
+                exit 0
+                ;;
+            \?) log_err "Unrecognized option: -$OPTARG"; return 1 ;;
+            :) log_err "Option -$OPTARG requires an argument."; return 1 ;;
+        esac
+    done
+
     check_system_requirements || return 1
-    resolve_paths || return 1
+    
+    if [[ -z "$IMG_PATH" ]]; then
+        read -r -p "Path to LUKS image: " IMG_PATH
+    fi
+    IMG_PATH=$(realpath -m -- "$IMG_PATH")
 
     api_open_luks || { log_err "Failed to open LUKS container."; return 1; }
 
     if [[ -z "$MOUNT_POINT" ]]; then
         read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
     fi
-    if [[ -z "$MOUNT_POINT" ]]; then
-        log_err "No mount point provided."
-        return 1
-    fi
-
     MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
+    
     api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
 
-    process_fscrypt_directories || { log_warn "Encountered issues processing fscrypt folders."; }
+    # Interactive fscrypt processing
+    if [[ -d "$MOUNT_POINT" ]]; then
+        while IFS= read -r -d '' dir; do
+            local rel_path="${dir#$MOUNT_POINT/}"
+            [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] && continue
+            if check_fscrypt_status "$dir"; then
+                log_info "Detected fscrypt directory: $rel_path"
+                api_decrypt_fscrypt "$dir" "$rel_path" || true
+            fi
+        done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
+    fi
 
-    log_info "CLI setup complete."
+    log_info "Interactive CLI setup complete."
     return 0
+}
+
+# --- Main Entry Point ---
+main() {
+    # Try handling as API call first. If it returns 1 (unknown command), run interactive CLI.
+    if handle_api "${1:-}" "$@"; then
+        exit 0
+    else
+        run_interactive_cli "$@"
+    fi
 }
 
 main "$@"
