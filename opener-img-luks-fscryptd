@@ -68,7 +68,7 @@ check_system_requirements() {
     if (( EUID != 0 )); then
         log_err "This script must be executed with root privileges."
         return 1
-    }
+    fi
 
     local required_commands=(cryptsetup mount umount fscrypt realpath mountpoint findmnt)
     for cmd in "${required_commands[@]}"; do
