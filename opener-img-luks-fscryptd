@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/init/env bash
 #
 # fscrypt-opener backend (Strict API/Daemon & Interactive CLI)
 # Licensed under GNU GPL v3
@@ -132,15 +132,16 @@ api_decrypt_fscrypt() {
     local rel_path="$2"
     log_info "Unlocking fscrypt directory: $target_dir"
 
-    # Verhindert Endlosschleifen bei Fehleingaben über --quiet oder tty-Check
+    # Im interaktiven Terminal ganz normal fscrypt unlock aufrufen (erlaubt Eingabe),
+    # im nicht-interaktiven Modus mit --quiet absichern, um Endlosschleifen zu verhindern.
     if [[ -t 0 ]]; then
         if ! fscrypt unlock "$target_dir"; then
-            log_err "Failed to unlock fscrypt directory: $rel_path (Incorrect passphrase or aborted)"
+            log_err "Failed to unlock fscrypt directory: $rel_path"
             return 1
         fi
     else
         if ! fscrypt unlock --quiet "$target_dir"; then
-            log_err "Failed to unlock fscrypt directory: $rel_path (Incorrect passphrase or aborted)"
+            log_err "Failed to unlock fscrypt directory in non-interactive mode: $rel_path"
             return 1
         fi
     fi
