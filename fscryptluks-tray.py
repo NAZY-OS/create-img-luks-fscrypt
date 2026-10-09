@@ -18,7 +18,7 @@ from gi.repository import Gtk, Gio, GLib, AyatanaAppIndicator3 as AppIndicator
 
 APP_ID = "org.gnu.fscrypt.opener"
 BACKEND_SCRIPT = "/usr/local/bin/fscrypt-opener.sh"
-UPDATE_INTERVAL_SEC = 5
+UPDATE_INTERVAL_SEC = 2
 
 ICON_DATA = {
     "green": '<svg width="16" height="16"><circle cx="8" cy="8" r="7" fill="#2ec27e" stroke="#1a8553" stroke-width="1"/></svg>',
@@ -52,7 +52,6 @@ def send_notification(title, msg, urgent=False):
 
 def get_backend_status():
     try:
-        # Status query runs without root permissions
         proc = subprocess.run([BACKEND_SCRIPT, "api_status"], capture_output=True, text=True, check=True)
         return json.loads(proc.stdout)
     except Exception:
@@ -71,12 +70,12 @@ class FscryptOptionsWindow(Gtk.Window):
         vbox.set_margin_bottom(16)
         self.set_child(vbox)
 
-        lbl = Gtk.Label(label="<b>Persistent Settings & Auto-Close</b>")
+        lbl = Gtk.Label(label="<b>Default Auto-Close Timeout (Minutes)</b>")
         lbl.set_use_markup(True)
         vbox.append(lbl)
 
         self.entry_autolock = Gtk.Entry()
-        self.entry_autolock.set_placeholder_text("Auto-lock timeout (Minutes)")
+        self.entry_autolock.set_placeholder_text("Minutes (e.g. 10)")
         vbox.append(self.entry_autolock)
 
         save_btn = Gtk.Button(label="Save to Config")
@@ -87,7 +86,7 @@ class FscryptOptionsWindow(Gtk.Window):
         val = self.entry_autolock.get_text()
         if val.isdigit():
             subprocess.run([BACKEND_SCRIPT, "api_save_setting", "DEFAULT_AUTOLOCK", val])
-            send_notification("Fscrypt Config", f"Auto-close timeout saved: {val} minutes.")
+            send_notification("Fscrypt Config", f"Default auto-close set to {val} minutes.")
             self.close()
         else:
             send_notification("Fscrypt Error", "Please enter a valid number.", urgent=True)
@@ -97,6 +96,9 @@ class FscryptTrayApp(Gtk.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.indicator = None
         self.settings_window = None
+        self.is_blinking = False
+        self.blink_state = False
+        self.notified_folders = set()
 
     def do_activate(self):
         if not ensure_icons_exist():
@@ -112,6 +114,7 @@ class FscryptTrayApp(Gtk.Application):
         
         self.update_ui()
         GLib.timeout_add_seconds(UPDATE_INTERVAL_SEC, self.update_ui)
+        GLib.timeout_add(500, self.check_blink)
 
     def update_ui(self):
         status_data = get_backend_status()
@@ -132,16 +135,41 @@ class FscryptTrayApp(Gtk.Application):
     def analyze_global_state(self, data):
         if data.get("luks_locked", True):
             self.set_icon_color("red")
-        else:
+            self.is_blinking = False
+            return
+
+        imminent = False
+        for folder in data.get("fscrypt_folders", []):
+            name = folder.get("name")
+            rem = folder.get("remaining_time_sec", -1)
+            
+            if 0 < rem < 120:
+                imminent = True
+                if name not in self.notified_folders:
+                    send_notification("Auto-Close Warning", f"Encrypted folder '{name}' locks in {rem} seconds!", urgent=True)
+                    self.notified_folders.add(name)
+            elif rem > 120 and name in self.notified_folders:
+                self.notified_folders.remove(name)
+
+        self.is_blinking = imminent
+        if not imminent:
             self.set_icon_color("green")
 
-    def execute_backend_action(self, action):
-        """Calls backend with pkexec since root is required for mount/cryptsetup"""
+    def check_blink(self):
+        if self.is_blinking:
+            self.blink_state = not self.blink_state
+            self.set_icon_color("orange" if self.blink_state else "red")
+        return True
+
+    def execute_backend_action(self, action, target=""):
         try:
-            subprocess.run(["pkexec", BACKEND_SCRIPT, action], check=True)
-            send_notification("Fscrypt", f"Action '{action}' executed successfully.")
+            cmd = ["pkexec", BACKEND_SCRIPT, action]
+            if target:
+                cmd.append(target)
+            subprocess.run(cmd, check=True)
+            send_notification("Fscrypt", f"Action {action} completed.")
         except subprocess.CalledProcessError as e:
-            send_notification("Fscrypt Error", f"Action failed: {e}", urgent=True)
+            send_notification("Fscrypt Error", f"Execution failed: {e}", urgent=True)
         self.update_ui()
 
     def create_menu_item(self, text, color):
@@ -157,8 +185,9 @@ class FscryptTrayApp(Gtk.Application):
         menu = Gtk.Menu()
         luks_locked = data.get("luks_locked", True)
         
+        # 1. Main container action
         if luks_locked:
-            open_item = Gtk.MenuItem(label="Open Container (Mount)")
+            open_item = Gtk.MenuItem(label="Open Container (LUKS)")
             open_item.connect("activate", lambda w: self.execute_backend_action("api_open"))
             menu.append(open_item)
         else:
@@ -168,10 +197,40 @@ class FscryptTrayApp(Gtk.Application):
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        # 2. Fscrypt Folders List & individual actions
+        for folder in data.get("fscrypt_folders", []):
+            name = folder.get("name")
+            locked = folder.get("locked")
+            rem = folder.get("remaining_time_sec", -1)
+            
+            color = "green" if not locked else "red"
+            if 0 < rem < 120:
+                color = "orange"
+                
+            time_txt = f" ({rem}s)" if 0 < rem < 99999 else ""
+            f_item = self.create_menu_item(f"FS: {name}{time_txt}", color)
+            
+            sub = Gtk.Menu()
+            if locked:
+                unlock_sub = Gtk.MenuItem(label="Decrypt / Unlock")
+                unlock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_unlock_folder", n))
+                sub.append(unlock_sub)
+            else:
+                lock_sub = Gtk.MenuItem(label="Lock Immediately")
+                lock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_lock_folder", n))
+                sub.append(lock_sub)
+            
+            f_item.set_submenu(sub)
+            menu.append(f_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # 3. Persistent Settings
         opt_item = Gtk.MenuItem(label="Persistent Settings...")
         opt_item.connect("activate", self.open_settings_window)
         menu.append(opt_item)
 
+        # 4. Quit
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", lambda w: self.quit())
         menu.append(quit_item)
