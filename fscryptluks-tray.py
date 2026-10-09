@@ -1,341 +1,187 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 #
-# fscrypt-opener GTK4 Tray Indicator & Detailed Status Window
+# fscrypt-opener D-Bus System Service
 # Licensed under GNU GPL v3
 
-import sys
 import os
-import json
 import subprocess
-import gi
+import json
+from pydbus import SystemBus
+from pydbus.generic import signal
 
-gi.require_version('Gtk', '4.0')
-gi.require_version('Gio', '2.0')
-gi.require_version('AyatanaAppIndicator3', '0.1')
+CONFIG_DIR = "/etc/fscrypt-opener"
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+RUN_DIR = "/run/fscrypt-opener"
 
-from gi.repository import Gtk, Gio, GLib, AyatanaAppIndicator3 as AppIndicator
+class FscryptOpenerService:
+    """
+    <node>
+        <interface name="org.fscrypt.Opener">
+            <method name="GetStatus">
+                <arg type="s" name="status_json" direction="out"/>
+            </method>
+            <method name="OpenAll">
+                <arg type="i" name="exit_code" direction="out"/>
+            </method>
+            <method name="CloseAll">
+                <arg type="i" name="exit_code" direction="out"/>
+            </method>
+            <method name="UnlockFolder">
+                <arg type="s" name="target_dir" direction="in"/>
+                <arg type="s" name="method" direction="in"/>
+                <arg type="s" name="key_file" direction="in"/>
+                <arg type="i" name="autoclose_min" direction="in"/>
+                <arg type="i" name="exit_code" direction="out"/>
+            </method>
+            <method name="LockFolder">
+                <arg type="s" name="target_dir" direction="in"/>
+                <arg type="i" name="exit_code" direction="out"/>
+            </method>
+            <method name="MountImage">
+                <arg type="s" name="img_path" direction="in"/>
+                <arg type="s" name="mapper_name" direction="in"/>
+                <arg type="s" name="mount_point" direction="in"/>
+                <arg type="i" name="exit_code" direction="out"/>
+            </method>
+        </interface>
+    </node>
+    """
+    dbus = None
 
-APP_ID = "org.gnu.fscrypt.opener"
-BACKEND_SCRIPT = "/usr/local/bin/fscrypt-opener.sh"
-UPDATE_INTERVAL_SEC = 2
-
-ICON_DATA = {
-    "green": '<svg width="16" height="16"><circle cx="8" cy="8" r="7" fill="#2ec27e" stroke="#1a8553" stroke-width="1"/></svg>',
-    "orange": '<svg width="16" height="16"><circle cx="8" cy="8" r="7" fill="#ff7800" stroke="#c64600" stroke-width="1"/></svg>',
-    "red": '<svg width="16" height="16"><circle cx="8" cy="8" r="7" fill="#ed333b" stroke="#a51d2d" stroke-width="1"/></svg>'
-}
-TEMP_ICON_DIR = "/tmp/fscrypt_tray_icons"
-
-def ensure_icons_exist():
-    try:
-        if not os.path.exists(TEMP_ICON_DIR):
-            os.makedirs(TEMP_ICON_DIR)
-        for color, data in ICON_DATA.items():
-            path = os.path.join(TEMP_ICON_DIR, f"dot_{color}.svg")
-            if not os.path.exists(path):
-                with open(path, "w") as f:
-                    f.write(data)
-        return True
-    except OSError:
-        return False
-
-def send_notification(title, msg, urgent=False):
-    notification = Gio.Notification.new(title)
-    notification.set_body(msg)
-    if urgent:
-        notification.set_priority(Gio.NotificationPriority.URGENT)
-    notification.set_icon(Gio.ThemedIcon.new("security-high-symbolic"))
-    app = Gio.Application.get_default()
-    if app:
-        app.send_notification(None, notification)
-
-def get_backend_status():
-    try:
-        proc = subprocess.run([BACKEND_SCRIPT, "api_status"], capture_output=True, text=True, check=True)
-        return json.loads(proc.stdout)
-    except Exception:
-        return None
-
-# --- Detailed Status & Management Window ---
-class FscryptStatusWindow(Gtk.Window):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.set_title("Fscrypt Detailed Status & Units")
-        self.set_default_size(450, 300)
-
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_start(16)
-        vbox.set_margin_end(16)
-        vbox.set_margin_top(16)
-        vbox.set_margin_bottom(16)
-        self.set_child(vbox)
-
-        lbl = Gtk.Label(label="<b>Active Secure Units & Countdowns</b>")
-        lbl.set_use_markup(True)
-        vbox.append(lbl)
-
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(True)
-        vbox.append(scrolled)
-
-        self.list_box = Gtk.ListBox()
-        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        scrolled.set_child(self.list_box)
-
-        refresh_btn = Gtk.Button(label="Refresh Status")
-        refresh_btn.connect("clicked", lambda b: self.populate_units())
-        vbox.append(refresh_btn)
-
-        self.populate_units()
-
-    def populate_units(self):
-        while True:
-            row = self.list_box.get_row_at_index(0)
-            if row is None:
-                break
-            self.list_box.remove(row)
-
-        data = get_backend_status()
-        if not data:
-            self.list_box.append(Gtk.Label(label="Failed to communicate with backend."))
-            return
-
-        luks_locked = data.get("luks_locked", True)
-        mount_pt = data.get("mount_point", "N/A")
-
-        luks_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        luks_row.append(Gtk.Label(label=f"LUKS Mount ({mount_pt}): {'Locked' if luks_locked else 'Active'}"))
-        self.list_box.append(luks_row)
-
-        folders = data.get("fscrypt_folders", [])
-        if not folders:
-            self.list_box.append(Gtk.Label(label="No fscrypt folders found or container closed."))
-        for folder in folders:
-            name = folder.get("name")
-            locked = folder.get("locked")
-            rem = folder.get("remaining_time_sec", -1)
-            
-            status_text = "Locked" if locked else f"Unlocked (Auto-lock in {rem}s)"
-            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            row_box.append(Gtk.Label(label=f"• {name}: {status_text}"))
-            self.list_box.append(row_box)
-
-# --- Settings Window ---
-class FscryptOptionsWindow(Gtk.Window):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.set_title("Fscrypt Persistent Settings")
-        self.set_default_size(350, 180)
-
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_start(16)
-        vbox.set_margin_end(16)
-        vbox.set_margin_top(16)
-        vbox.set_margin_bottom(16)
-        self.set_child(vbox)
-
-        lbl = Gtk.Label(label="<b>Default Auto-Close Timeout (Minutes)</b>")
-        lbl.set_use_markup(True)
-        vbox.append(lbl)
-
-        self.entry_autolock = Gtk.Entry()
-        self.entry_autolock.set_placeholder_text("Minutes (e.g. 10)")
-        vbox.append(self.entry_autolock)
-
-        save_btn = Gtk.Button(label="Save to Config")
-        save_btn.connect("clicked", self.on_save_clicked)
-        vbox.append(save_btn)
-
-    def on_save_clicked(self, button):
-        val = self.entry_autolock.get_text()
-        if val.isdigit():
-            subprocess.run([BACKEND_SCRIPT, "api_save_setting", "DEFAULT_AUTOLOCK", val])
-            send_notification("Fscrypt Config", f"Default auto-close set to {val} minutes.")
-            self.close()
-        else:
-            send_notification("Fscrypt Error", "Please enter a valid number.", urgent=True)
-
-# --- Main Tray Application ---
-class FscryptTrayApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
-        self.indicator = None
-        self.settings_window = None
-        self.status_window = None
-        self.is_blinking = False
-        self.blink_state = False
-        self.notified_folders = set()
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(RUN_DIR, exist_ok=True)
+        if not os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "w") as f:
+                f.write("secure_img1|/var/lib/secure1.img|/mnt/secure1|custom\n")
 
-    def do_activate(self):
-        if not ensure_icons_exist():
-            self.quit()
-            return
+    def GetStatus(self):
+        containers = []
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("|")
+                    if len(parts) < 4:
+                        continue
+                    mapper, img, mount, method = [p.strip() for p in parts]
 
-        self.indicator = AppIndicator.Indicator.new(
-            APP_ID,
-            os.path.join(TEMP_ICON_DIR, "dot_red.svg"),
-            AppIndicator.IndicatorCategory.SYSTEM_SERVICES
-        )
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+                    luks_locked = True
+                    actual_mount = "N/A"
+                    res = subprocess.run(["cryptsetup", "status", mapper], capture_output=True)
+                    if res.returncode == 0:
+                        luks_locked = False
+                        # Mountpunkt ermitteln
+                        mres = subprocess.run(["findmnt", "-n", "-o", "TARGET", f"/dev/mapper/{mapper}"], capture_output=True, text=True)
+                        actual_mount = mres.stdout.strip() or mount
+
+                    folders = []
+                    if not luks_locked and os.path.isdir(actual_mount):
+                        for entry in os.listdir(actual_mount):
+                            if entry.startswith(".") or entry == "lost+found":
+                                continue
+                            fpath = os.path.join(actual_mount, entry)
+                            if os.path.isdir(fpath):
+                                flocked = True
+                                sres = subprocess.run(["fscrypt", "status", fpath], capture_output=True, text=True)
+                                if "unlocked: yes" in sres.stdout.lower():
+                                    flocked = False
+                                folders.append({
+                                    "name": entry,
+                                    "path": fpath,
+                                    "locked": flocked,
+                                    "method": method
+                                })
+
+                    containers.append({
+                        "mapper": mapper,
+                        "image": img,
+                        "mount_point": actual_mount,
+                        "luks_locked": luks_locked,
+                        "fscrypt_folders": folders
+                    })
+        return json.dumps({"containers": containers})
+
+    def OpenAll(self):
+        if not os.path.exists(CONFIG_FILE):
+            return 1
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 4:
+                    continue
+                mapper, img, mount, _ = parts
+                self.MountImage(img, mapper, mount)
+        return 0
+
+    def CloseAll(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in line.split("|")]
+                    if len(parts) < 4:
+                        continue
+                    mapper, _, mount, _ = parts
+                    subprocess.run(["umount", mount], capture_output=True)
+                    subprocess.run(["cryptsetup", "luksClose", mapper], capture_output=True)
+        return 0
+
+    def MountImage(self, img_path, mapper_name, mount_point):
+        if not os.path.exists(img_path):
+            return 1
+        # LUKS öffnen (ohne TTY übergeben wir stdin leer oder nutzen Standard)
+        res = subprocess.run(["cryptsetup", "status", mapper_name], capture_output=True)
+        if res.returncode != 0:
+            open_res = subprocess.run(["cryptsetup", "luksOpen", img_path, mapper_name], capture_output=True)
+            if open_res.returncode != 0:
+                return 1
         
-        self.update_ui()
-        GLib.timeout_add_seconds(UPDATE_INTERVAL_SEC, self.update_ui)
-        GLib.timeout_add(500, self.check_blink)
+        os.makedirs(mount_point, exist_ok=True)
+        mount_res = subprocess.run(["mount", f"/dev/mapper/{mapper_name}", mount_point], capture_output=True)
+        return mount_res.returncode
 
-    def update_ui(self):
-        status_data = get_backend_status()
-        if not status_data:
-            self.set_icon_color("red")
-            self.build_error_menu()
-            return True
+    def UnlockFolder(self, target_dir, method, key_file, autoclose_min):
+        cmd = ["fscrypt", "unlock", "--quiet"]
+        if method == "raw_key" and key_file and os.path.exists(key_file):
+            cmd.append(f"--key={key_file}")
+        cmd.append(target_dir)
 
-        self.analyze_global_state(status_data)
-        self.build_dynamic_menu(status_data)
-        return True
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode != 0:
+            return 1
 
-    def set_icon_color(self, color):
-        if self.indicator:
-            path = os.path.join(TEMP_ICON_DIR, f"dot_{color}.svg")
-            self.indicator.set_icon_full(path, f"Status: {color}")
+        if autoclose_min > 0:
+            safe_name = target_dir.replace("/", "_")
+            timer_file = os.path.join(RUN_DIR, f"timer_{safe_name}")
+            import time
+            expire_epoch = int(time.time()) + (autoclose_min * 60)
+            with open(timer_file, "w") as tf:
+                tf.write(str(expire_epoch))
 
-    def analyze_global_state(self, data):
-        if data.get("luks_locked", True):
-            self.set_icon_color("red")
-            self.is_blinking = False
-            return
+            # Hintergrund-Timer starten
+            subprocess.Popen(f"sleep {autoclose_min * 60} && fscrypt lock '{target_dir}' && rm -f '{timer_file}'", shell=True)
 
-        imminent = False
-        for folder in data.get("fscrypt_folders", []):
-            name = folder.get("name")
-            rem = folder.get("remaining_time_sec", -1)
-            
-            if 0 < rem < 120:
-                imminent = True
-                if name not in self.notified_folders:
-                    send_notification("Auto-Close Warning", f"Encrypted folder '{name}' locks in {rem} seconds!", urgent=True)
-                    self.notified_folders.add(name)
-            elif rem > 120 and name in self.notified_folders:
-                self.notified_folders.remove(name)
+        return 0
 
-        self.is_blinking = imminent
-        if not imminent:
-            self.set_icon_color("green")
-
-    def check_blink(self):
-        if self.is_blinking:
-            self.blink_state = not self.blink_state
-            self.set_icon_color("orange" if self.blink_state else "red")
-        return True
-
-    def execute_backend_action(self, action, target=""):
-        try:
-            cmd = ["pkexec", BACKEND_SCRIPT, action]
-            if target:
-                cmd.append(target)
-            subprocess.run(cmd, check=True)
-            send_notification("Fscrypt", f"Action {action} completed.")
-        except subprocess.CalledProcessError as e:
-            send_notification("Fscrypt Error", f"Execution failed: {e}", urgent=True)
-        self.update_ui()
-
-    def create_menu_item(self, text, color):
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        img = Gtk.Image.new_from_file(os.path.join(TEMP_ICON_DIR, f"dot_{color}.svg"))
-        box.append(img)
-        box.append(Gtk.Label(label=text))
-        item = Gtk.MenuItem()
-        item.set_child(box)
-        return item
-
-    def build_dynamic_menu(self, data):
-        menu = Gtk.Menu()
-        luks_locked = data.get("luks_locked", True)
-        
-        if luks_locked:
-            open_item = Gtk.MenuItem(label="Open Container (LUKS)")
-            open_item.connect("activate", lambda w: self.execute_backend_action("api_open"))
-            menu.append(open_item)
-        else:
-            close_item = Gtk.MenuItem(label="Close Container (Umount)")
-            close_item.connect("activate", lambda w: self.execute_backend_action("api_close"))
-            menu.append(close_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        for folder in data.get("fscrypt_folders", []):
-            name = folder.get("name")
-            locked = folder.get("locked")
-            rem = folder.get("remaining_time_sec", -1)
-            
-            color = "green" if not locked else "red"
-            if 0 < rem < 120:
-                color = "orange"
-                
-            time_txt = f" ({rem}s)" if 0 < rem < 99999 else ""
-            f_item = self.create_menu_item(f"FS: {name}{time_txt}", color)
-            
-            sub = Gtk.Menu()
-            if locked:
-                unlock_sub = Gtk.MenuItem(label="Decrypt / Unlock")
-                unlock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_unlock_folder", n))
-                sub.append(unlock_sub)
-            else:
-                lock_sub = Gtk.MenuItem(label="Lock Immediately")
-                lock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_lock_folder", n))
-                sub.append(lock_sub)
-            
-            f_item.set_submenu(sub)
-            menu.append(f_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        status_item = Gtk.MenuItem(label="Detailed Status & Units...")
-        status_item.connect("activate", self.open_status_window)
-        menu.append(status_item)
-
-        opt_item = Gtk.MenuItem(label="Persistent Settings...")
-        opt_item.connect("activate", self.open_settings_window)
-        menu.append(opt_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda w: self.quit())
-        menu.append(quit_item)
-
-        if self.indicator:
-            self.indicator.set_menu(menu)
-            menu.show_all()
-
-    def open_status_window(self, widget):
-        if not self.status_window:
-            self.status_window = FscryptStatusWindow()
-            self.status_window.connect("destroy", lambda w: setattr(self, 'status_window', None))
-        self.status_window.present()
-
-    def open_settings_window(self, widget):
-        if not self.settings_window:
-            self.settings_window = FscryptOptionsWindow()
-            self.settings_window.connect("destroy", lambda w: setattr(self, 'settings_window', None))
-        self.settings_window.present()
-
-    def build_error_menu(self):
-        menu = Gtk.Menu()
-        err_item = Gtk.MenuItem(label="Backend Unreachable")
-        err_item.set_sensitive(False)
-        menu.append(err_item)
-        menu.append(Gtk.SeparatorMenuItem())
-        quit_item = Gtk.MenuItem(label="Quit")
-        quit_item.connect("activate", lambda w: self.quit())
-        menu.append(quit_item)
-        if self.indicator:
-            self.indicator.set_menu(menu)
-            menu.show_all()
-
-def main():
-    app = FscryptTrayApp()
-    return app.run(sys.argv)
+    def LockFolder(self, target_dir):
+        res = subprocess.run(["fscrypt", "lock", target_dir], capture_output=True)
+        safe_name = target_dir.replace("/", "_")
+        timer_file = os.path.join(RUN_DIR, f"timer_{safe_name}")
+        if os.path.exists(timer_file):
+            os.remove(timer_file)
+        return res.returncode
 
 if __name__ == "__main__":
-    sys.exit(main())
+    bus = SystemBus()
+    bus.publish("org.fscrypt.Opener", FscryptOpenerService())
+    import glib
+    loop = glib.MainLoop()
+    loop.run()
