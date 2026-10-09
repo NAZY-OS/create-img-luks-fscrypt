@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# fscrypt-opener GTK4 Tray Indicator (Unprivileged User GUI)
+# fscrypt-opener GTK4 Tray Indicator & Detailed Status Window
 # Licensed under GNU GPL v3
 
 import sys
@@ -57,11 +57,79 @@ def get_backend_status():
     except Exception:
         return None
 
+# --- Detailed Status & Management Window ---
+class FscryptStatusWindow(Gtk.Window):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_title("Fscrypt Detailed Status & Units")
+        self.set_default_size(450, 300)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        vbox.set_margin_top(16)
+        vbox.set_margin_bottom(16)
+        self.set_child(vbox)
+
+        lbl = Gtk.Label(label="<b>Active Secure Units & Countdowns</b>")
+        lbl.set_use_markup(True)
+        vbox.append(lbl)
+
+        # Scrolled window containing list of units
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        vbox.append(scrolled)
+
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        scrolled.set_child(self.list_box)
+
+        refresh_btn = Gtk.Button(label="Refresh Status")
+        refresh_btn.connect("clicked", lambda b: self.populate_units())
+        vbox.append(refresh_btn)
+
+        self.populate_units()
+
+    def populate_units(self):
+        while True:
+            row = self.list_box.get_row_at_index(0)
+            if row is None:
+                break
+            self.list_box.remove(row)
+
+        data = get_backend_status()
+        if not data:
+            self.list_box.append(Gtk.Label(label="Failed to communicate with backend."))
+            return
+
+        luks_locked = data.get("luks_locked", True)
+        mount_pt = data.get("mount_point", "N/A")
+
+        # Add LUKS container row
+        luks_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        luks_row.append(Gtk.Label(label=f"LUKS Mount ({mount_pt}): {'Locked' if luks_locked else 'Active'}"))
+        self.list_box.append(luks_row)
+
+        # Add fscrypt folders rows
+        folders = data.get("fscrypt_folders", [])
+        if not folders:
+            self.list_box.append(Gtk.Label(label="No fscrypt folders found or container closed."))
+        for folder in folders:
+            name = folder.get("name")
+            locked = folder.get("locked")
+            rem = folder.get("remaining_time_sec", -1)
+            
+            status_text = "Locked" if locked else f"Unlocked (Auto-lock in {rem}s)"
+            row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            row_box.append(Gtk.Label(label=f"• {name}: {status_text}"))
+            self.list_box.append(row_box)
+
+# --- Settings Window ---
 class FscryptOptionsWindow(Gtk.Window):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.set_title("Fscrypt Persistent Settings")
-        self.set_default_size(350, 200)
+        self.set_default_size(350, 180)
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         vbox.set_margin_start(16)
@@ -91,11 +159,13 @@ class FscryptOptionsWindow(Gtk.Window):
         else:
             send_notification("Fscrypt Error", "Please enter a valid number.", urgent=True)
 
+# --- Main Tray Application ---
 class FscryptTrayApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
         self.indicator = None
         self.settings_window = None
+        self.status_window = None
         self.is_blinking = False
         self.blink_state = False
         self.notified_folders = set()
@@ -197,38 +267,17 @@ class FscryptTrayApp(Gtk.Application):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 2. Fscrypt Folders List & individual actions
-        for folder in data.get("fscrypt_folders", []):
-            name = folder.get("name")
-            locked = folder.get("locked")
-            rem = folder.get("remaining_time_sec", -1)
-            
-            color = "green" if not locked else "red"
-            if 0 < rem < 120:
-                color = "orange"
-                
-            time_txt = f" ({rem}s)" if 0 < rem < 99999 else ""
-            f_item = self.create_menu_item(f"FS: {name}{time_txt}", color)
-            
-            sub = Gtk.Menu()
-            if locked:
-                unlock_sub = Gtk.MenuItem(label="Decrypt / Unlock")
-                unlock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_unlock_folder", n))
-                sub.append(unlock_sub)
-            else:
-                lock_sub = Gtk.MenuItem(label="Lock Immediately")
-                lock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_lock_folder", n))
-                sub.append(lock_sub)
-            
-            f_item.set_submenu(sub)
-            menu.append(f_item)
-
-        menu.append(Gtk.SeparatorMenuItem())
+        # 2. Detailed Status Window Option
+        status_item = Gtk.MenuItem(label="Detailed Status & Units...")
+        status_item.connect("activate", self.open_status_window)
+        menu.append(status_item)
 
         # 3. Persistent Settings
         opt_item = Gtk.MenuItem(label="Persistent Settings...")
         opt_item.connect("activate", self.open_settings_window)
         menu.append(opt_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
 
         # 4. Quit
         quit_item = Gtk.MenuItem(label="Quit")
@@ -238,6 +287,12 @@ class FscryptTrayApp(Gtk.Application):
         if self.indicator:
             self.indicator.set_menu(menu)
             menu.show_all()
+
+    def open_status_window(self, widget):
+        if not self.status_window:
+            self.status_window = FscryptStatusWindow()
+            self.status_window.connect("destroy", lambda w: setattr(self, 'status_window', None))
+        self.status_window.present()
 
     def open_settings_window(self, widget):
         if not self.settings_window:
