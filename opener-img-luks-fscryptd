@@ -58,6 +58,26 @@ load_config() {
     fi
 }
 
+# --- Enhanced getopt parsing supporting manual/cli mode ---
+parse_args() {
+    while getopts ":c:i:m:Mh" opt; do
+        case "$opt" in
+            c) CONFIG_FILE="$OPTARG" ;;
+            i) IMG_PATH="$OPTARG" ;;
+            m) MOUNT_POINT="$OPTARG" ;;
+            M) MANUAL_MODE=true ;;
+            h)
+                echo "Usage: $0 [-c config] [-i image] [-m mountpoint] [-M (manual interactive)]"
+                echo "       $0 api_status | api_open | api_close | ..."
+                exit 0
+                ;;
+            \?) log_err "Unrecognized option: -$OPTARG"; return 1 ;;
+            :) log_err "Option -$OPTARG requires an argument."; return 1 ;;
+        esac
+    done
+    return 0
+}
+
 check_system_requirements() {
     if [[ $EUID -ne 0 ]]; then
         log_err "This script must be executed with root privileges."
@@ -74,24 +94,37 @@ check_system_requirements() {
 }
 
 resolve_paths() {
-    if [[ -z "$IMG_PATH" || ! -f "$IMG_PATH" ]]; then
-        log_err "No valid image specified in config."
-        return 1
+    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
+        log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
+        IMG_PATH=""
     fi
+
+    if [[ -z "$IMG_PATH" ]]; then
+        read -r -p "Path to LUKS image (e.g., /secure/storage.img): " IMG_PATH
+    fi
+
+    if [[ -z "$IMG_PATH" || ! -f "$IMG_PATH" ]]; then
+        log_err "No valid image specified."
+        return 1
+    }
+
     IMG_PATH=$(realpath -m -- "$IMG_PATH")
     return 0
 }
 
 api_open_luks() {
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
+        log_info "LUKS volume '$MAPPER_NAME' is already open."
         return 0
     else
+        log_info "Opening LUKS volume: $IMG_PATH"
         cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
     fi
 }
 
 api_mount_fs() {
     if ! mountpoint -q -- "$MOUNT_POINT"; then
+        log_info "Mounting filesystem to $MOUNT_POINT"
         mkdir -p -- "$MOUNT_POINT"
         mount "/dev/mapper/$MAPPER_NAME" "$MOUNT_POINT" || return 1
     fi
@@ -108,12 +141,11 @@ check_fscrypt_status() {
     echo "$status_out" | grep -qiE "encrypted:\s*yes|policy:|not unlocked"
 }
 
-# GUI-gestütztes Entschlüsseln via zenity/kdialog oder Standard-Passphrase
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
+    log_info "Unlocking fscrypt directory: $target_dir"
     
-    # Passwort über grafischen Dialog abfragen falls möglich
     local passphrase=""
     if command -v zenity >/dev/null 2>&1; then
         passphrase=$(zenity --password --title="Fscrypt Unlock" --text="Enter passphrase for $rel_path:" 2>/dev/null || true)
@@ -127,7 +159,6 @@ api_decrypt_fscrypt() {
         fscrypt unlock "$target_dir" || return 1
     fi
 
-    # Auto-Lock Timer starten und Endzeitpunkt in /run/fscrypt-opener/ hinterlegen
     local safe_name="${rel_path//[^a-zA-Z0-9_]/_}"
     local config_var="AUTOLOCK_${safe_name}"
     local lock_min="${!config_var:-${DEFAULT_AUTOLOCK:-10}}"
@@ -150,6 +181,26 @@ api_lock_fscrypt() {
     local safe_name="${rel_path//[^a-zA-Z0-9_]/_}"
     fscrypt lock "$target_dir"
     rm -f "$RUN_DIR/timer_${safe_name}"
+}
+
+# Interactive manual processing of fscrypt directories
+process_fscrypt_directories() {
+    if [[ ! -d "$MOUNT_POINT" ]]; then
+        log_err "Mount point is invalid: $MOUNT_POINT"
+        return 1
+    fi
+
+    log_info "Scanning subdirectories in $MOUNT_POINT..."
+    while IFS= read -r -d '' dir; do
+        local rel_path="${dir#$MOUNT_POINT/}"
+        [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] && continue
+
+        if check_fscrypt_status "$dir"; then
+            log_info "Detected fscrypt directory: $rel_path"
+            api_decrypt_fscrypt "$dir" "$rel_path" || continue
+        fi
+    done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
+    return 0
 }
 
 api_output_json_status() {
@@ -181,9 +232,7 @@ api_output_json_status() {
                 if [[ "$locked" == "false" && -f "$RUN_DIR/timer_${safe_name}" ]]; then
                     local expire_epoch
                     expire_epoch=$(cat "$RUN_DIR/timer_${safe_name}")
-                    local current_epoch
-                    current_epoch=$(date +%s)
-                    rem_sec=$(( expire_epoch - current_epoch ))
+                    rem_sec=$(( expire_epoch - $(date +%s) ))
                     (( rem_sec < 0 )) && rem_sec=0
                 elif [[ "$locked" == "false" ]]; then
                     rem_sec=99999
@@ -225,59 +274,62 @@ api_close_all() {
     log_info "Container closed successfully."
 }
 
+# --- Main Logic ---
 main() {
     create_default_config
     load_config "$CONFIG_FILE"
 
+    # Handle API requests
     case "${1:-}" in
-        api_status)
-            api_output_json_status
-            exit 0
-            ;;
+        api_status) api_output_json_status; exit 0 ;;
         api_open)
             check_system_requirements || exit 1
             resolve_paths || exit 1
             api_open_luks || exit 1
             [[ -z "$MOUNT_POINT" ]] && MOUNT_POINT="/mnt/secure"
             api_mount_fs || exit 1
-            # Scan & Auto-unlock directories if configured
-            while IFS= read -r -d '' dir; do
-                local rel_path="${dir#$MOUNT_POINT/}"
-                [[ "$rel_path" == "lost+found" || "$rel_path" =~ ^\. ]] && continue
-                if check_fscrypt_status "$dir"; then
-                    api_decrypt_fscrypt "$dir" "$rel_path" || true
-                fi
-            done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
             exit 0
             ;;
-        api_close)
-            check_system_requirements || exit 1
-            api_close_all
-            exit 0
-            ;;
+        api_close) check_system_requirements || exit 1; api_close_all; exit 0 ;;
         api_unlock_folder)
             check_system_requirements || exit 1
             load_config "$CONFIG_FILE"
             local target_dir="$MOUNT_POINT/$2"
-            if [[ -d "$target_dir" ]]; then
-                api_decrypt_fscrypt "$target_dir" "$2"
-            fi
+            [[ -d "$target_dir" ]] && api_decrypt_fscrypt "$target_dir" "$2"
             exit 0
             ;;
         api_lock_folder)
             check_system_requirements || exit 1
             load_config "$CONFIG_FILE"
             local target_dir="$MOUNT_POINT/$2"
-            if [[ -d "$target_dir" ]]; then
-                api_lock_fscrypt "$target_dir" "$2"
-            fi
+            [[ -d "$target_dir" ]] && api_lock_fscrypt "$target_dir" "$2"
             exit 0
             ;;
-        api_save_setting)
-            api_save_setting "$2" "$3"
-            exit 0
-            ;;
+        api_save_setting) api_save_setting "$2" "$3"; exit 0 ;;
     esac
+
+    # Interactive CLI Manual Mode (triggered via getopt or direct execution)
+    parse_args "$@" || return 1
+    check_system_requirements || return 1
+    resolve_paths || return 1
+
+    api_open_luks || { log_err "Failed to open LUKS container."; return 1; }
+
+    if [[ -z "$MOUNT_POINT" ]]; then
+        read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
+    fi
+    if [[ -z "$MOUNT_POINT" ]]; then
+        log_err "No mount point provided."
+        return 1
+    fi
+
+    MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
+    api_mount_fs || { log_err "Failed to mount filesystem."; return 1; }
+
+    process_fscrypt_directories || { log_warn "Encountered issues processing fscrypt folders."; }
+
+    log_info "Manual setup complete."
+    return 0
 }
 
 main "$@"
