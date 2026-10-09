@@ -1,4 +1,4 @@
-#!/usr/init/env bash
+#!/usr/bin/env bash
 #
 # fscrypt-opener backend (Strict API/Daemon & Interactive CLI)
 # Licensed under GNU GPL v3
@@ -20,7 +20,6 @@ IMG_PATH=""
 MOUNT_POINT=""
 MAPPER_NAME="secure_img_api"
 
-# --- Cleanup & Trap ---
 cleanup() {
     local exit_code=$?
     if (( exit_code != 0 )); then
@@ -35,7 +34,6 @@ create_default_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_info "Creating default configuration at $CONFIG_FILE..."
         cat << 'EOF' > "$CONFIG_FILE"
-# Standard configuration for fscrypt-opener
 IMG_PATH=""
 MOUNT_POINT=""
 DEFAULT_AUTOLOCK="10"
@@ -127,23 +125,43 @@ check_fscrypt_status() {
     echo "$status_out" | grep -qiE "encrypted:[[:space:]]*yes|policy:|not unlocked"
 }
 
+# --- Spezielle Funktion 1: Interaktiver Modus (für das Terminal) ---
+fscrypt_unlock_interactive() {
+    local target_dir="$1"
+    local rel_path="$2"
+    log_info "Unlocking fscrypt directory interactively: $target_dir"
+
+    # Führt fscrypt direkt aus; das Terminal übernimmt die Interaktion,
+    # bricht aber bei Fehleingabe kontrolliert ab ohne Endlosschleife im Skript.
+    if ! fscrypt unlock "$target_dir"; then
+        log_err "Failed to unlock fscrypt directory: $rel_path"
+        return 1
+    fi
+    return 0
+}
+
+# --- Spezielle Funktion 2: Nicht-interaktiver Modus (für API / GUI / pkexec) ---
+fscrypt_unlock_noninteractive() {
+    local target_dir="$1"
+    local rel_path="$2"
+    log_info "Unlocking fscrypt directory non-interactively: $target_dir"
+
+    # Nutzt --quiet, um jegliche Endlosschleifen im Hintergrund zu blockieren
+    if ! fscrypt unlock --quiet "$target_dir"; then
+        log_err "Failed to unlock fscrypt directory in non-interactive mode: $rel_path"
+        return 1
+    fi
+    return 0
+}
+
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
-    log_info "Unlocking fscrypt directory: $target_dir"
 
-    # Im interaktiven Terminal ganz normal fscrypt unlock aufrufen (erlaubt Eingabe),
-    # im nicht-interaktiven Modus mit --quiet absichern, um Endlosschleifen zu verhindern.
     if [[ -t 0 ]]; then
-        if ! fscrypt unlock "$target_dir"; then
-            log_err "Failed to unlock fscrypt directory: $rel_path"
-            return 1
-        fi
+        fscrypt_unlock_interactive "$target_dir" "$rel_path" || return 1
     else
-        if ! fscrypt unlock --quiet "$target_dir"; then
-            log_err "Failed to unlock fscrypt directory in non-interactive mode: $rel_path"
-            return 1
-        fi
+        fscrypt_unlock_noninteractive "$target_dir" "$rel_path" || return 1
     fi
 
     local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
@@ -243,7 +261,6 @@ api_close_all() {
     log_info "Container closed successfully."
 }
 
-# --- Strict API & Daemon Router ---
 handle_api() {
     create_default_config
     load_config "$CONFIG_FILE"
@@ -291,8 +308,6 @@ handle_api() {
             ;;
         -h|--help)
             echo "Usage: $0 [API_COMMAND] [ARGS...]"
-            echo "API Commands: api_status, api_open, api_close, api_unlock_folder <name>, api_lock_folder <name>, api_save_setting <key> <val>, daemon"
-            echo "Run without parameters for interactive CLI mode."
             exit 0
             ;;
         *)
@@ -301,16 +316,8 @@ handle_api() {
     esac
 }
 
-# --- Interactive CLI Mode ---
 run_interactive_cli() {
     create_default_config
-    
-    echo "=== Current Configuration Contents ==="
-    if [[ -f "$CONFIG_FILE" ]]; then
-        cat "$CONFIG_FILE"
-    fi
-    echo "======================================"
-
     load_config "$CONFIG_FILE"
 
     while getopts ":c:i:m:h" opt; do
@@ -318,12 +325,9 @@ run_interactive_cli() {
             c) CONFIG_FILE="$OPTARG" ;;
             i) IMG_PATH="$OPTARG" ;;
             m) MOUNT_POINT="$OPTARG" ;;
-            h)
-                echo "Usage: $0 [-c config] [-i image] [-m mountpoint]"
-                exit 0
-                ;;
-            \?) log_err "Unrecognized option: -$OPTARG"; return 1 ;;
-            :) log_err "Option -$OPTARG requires an argument."; return 1 ;;
+            h) exit 0 ;;
+            \?) return 1 ;;
+            :) return 1 ;;
         esac
     done
 
