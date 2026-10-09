@@ -75,7 +75,6 @@ class FscryptStatusWindow(Gtk.Window):
         lbl.set_use_markup(True)
         vbox.append(lbl)
 
-        # Scrolled window containing list of units
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_vexpand(True)
         vbox.append(scrolled)
@@ -105,12 +104,10 @@ class FscryptStatusWindow(Gtk.Window):
         luks_locked = data.get("luks_locked", True)
         mount_pt = data.get("mount_point", "N/A")
 
-        # Add LUKS container row
         luks_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         luks_row.append(Gtk.Label(label=f"LUKS Mount ({mount_pt}): {'Locked' if luks_locked else 'Active'}"))
         self.list_box.append(luks_row)
 
-        # Add fscrypt folders rows
         folders = data.get("fscrypt_folders", [])
         if not folders:
             self.list_box.append(Gtk.Label(label="No fscrypt folders found or container closed."))
@@ -255,7 +252,6 @@ class FscryptTrayApp(Gtk.Application):
         menu = Gtk.Menu()
         luks_locked = data.get("luks_locked", True)
         
-        # 1. Main container action
         if luks_locked:
             open_item = Gtk.MenuItem(label="Open Container (LUKS)")
             open_item.connect("activate", lambda w: self.execute_backend_action("api_open"))
@@ -267,19 +263,43 @@ class FscryptTrayApp(Gtk.Application):
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 2. Detailed Status Window Option
+        for folder in data.get("fscrypt_folders", []):
+            name = folder.get("name")
+            locked = folder.get("locked")
+            rem = folder.get("remaining_time_sec", -1)
+            
+            color = "green" if not locked else "red"
+            if 0 < rem < 120:
+                color = "orange"
+                
+            time_txt = f" ({rem}s)" if 0 < rem < 99999 else ""
+            f_item = self.create_menu_item(f"FS: {name}{time_txt}", color)
+            
+            sub = Gtk.Menu()
+            if locked:
+                unlock_sub = Gtk.MenuItem(label="Decrypt / Unlock")
+                unlock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_unlock_folder", n))
+                sub.append(unlock_sub)
+            else:
+                lock_sub = Gtk.MenuItem(label="Lock Immediately")
+                lock_sub.connect("activate", lambda w, n=name: self.execute_backend_action("api_lock_folder", n))
+                sub.append(lock_sub)
+            
+            f_item.set_submenu(sub)
+            menu.append(f_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         status_item = Gtk.MenuItem(label="Detailed Status & Units...")
         status_item.connect("activate", self.open_status_window)
         menu.append(status_item)
 
-        # 3. Persistent Settings
         opt_item = Gtk.MenuItem(label="Persistent Settings...")
         opt_item.connect("activate", self.open_settings_window)
         menu.append(opt_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
-        # 4. Quit
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", lambda w: self.quit())
         menu.append(quit_item)
