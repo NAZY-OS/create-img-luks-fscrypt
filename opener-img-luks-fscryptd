@@ -149,6 +149,16 @@ api_mount_fs() {
     fi
 }
 
+# Check if a directory has fscrypt policy/encryption configured
+is_fscrypt_dir() {
+    local target_dir="$1"
+    # fscrypt status returns info if a directory is encrypted
+    if fscrypt status "$target_dir" 2>/dev/null | grep -q "Encrypted:yes"; then
+        return 0
+    fi
+    return 1
+}
+
 api_decrypt_fscrypt() {
     local target_dir="$1"
     local rel_path="$2"
@@ -181,7 +191,6 @@ main() {
     check_system_requirements
     resolve_paths
 
-    # Check if LUKS mapper is already active
     local luks_was_active=false
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
         luks_was_active=true
@@ -189,9 +198,7 @@ main() {
 
     api_open_luks || exit 1
 
-    # Handle Mount Point selection when LUKS was already open
     if [[ "$luks_was_active" == "true" ]]; then
-        # Try to find current mount point of the mapper if already mounted
         local existing_mount
         existing_mount=$(findmnt -n -o TARGET "/dev/mapper/$MAPPER_NAME" 2>/dev/null || true)
 
@@ -214,7 +221,6 @@ main() {
                 MOUNT_POINT="$existing_mount"
             fi
         else
-            # Active but not mounted yet
             if [[ -z "$MOUNT_POINT" ]]; then
                 read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
             fi
@@ -226,35 +232,34 @@ main() {
             api_mount_fs || exit 1
         fi
     else
-        # Normal flow for freshly opened LUKS
-        if [[ -n "$MOUNT_POINT" ]] && [[ ! -d "$MOUNT_POINT" ]]; then
-            log_warn "Configured mount point does not exist as a directory: $MOUNT_POINT (will be created)"
-        fi
-
         if [[ -z "$MOUNT_POINT" ]]; then
             read -r -p "Mount point (e.g., /mnt/secure): " MOUNT_POINT
         fi
-
         if [[ -z "$MOUNT_POINT" ]]; then
             log_err "No mount point specified."
             exit 1
         fi
-
         MOUNT_POINT=$(realpath -m -- "$MOUNT_POINT")
         api_mount_fs || exit 1
     fi
 
     if [[ -d "$MOUNT_POINT" ]]; then
+        # Build clean list of potential subdirectories (excluding hidden files/dirs and lost+found)
+        local target_dirs=()
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$MOUNT_POINT/}"
-            
-            # Skip system directories like lost+found
-            if [[ "$rel_path" == "lost+found" || -z "$rel_path" ]]; then
+            if [[ "$rel_path" == "lost+found" || "$rel_path" =~ ^\. ]] || [[ -z "$rel_path" ]]; then
                 continue
             fi
+            target_dirs+=("$dir")
+        done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
 
-            # Check if directory is encrypted with fscrypt
-            if [[ -d "$dir/.fscrypt" ]]; then
+        for dir in "${target_dirs[@]}"; do
+            local rel_path="${dir#$MOUNT_POINT/}"
+            local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
+
+            # Verify if this specific folder is configured with fscrypt encryption
+            if is_fscrypt_dir "$dir"; then
                 log_info "Found encrypted fscrypt folder: $rel_path"
                 api_decrypt_fscrypt "$dir" "$rel_path" || { log_err "Skipping $rel_path due to unlock failure."; continue; }
             else
@@ -262,7 +267,7 @@ main() {
                 continue
             fi
 
-            local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
+            # Handle Auto-Lock configuration per folder
             local config_var_name="AUTOLOCK_${safe_var_name}"
             local current_auto_lock="${!config_var_name:-}"
             local auto_lock_min=""
@@ -291,8 +296,7 @@ main() {
             else
                 log_info "No auto-lock configured for '$rel_path' (remains open indefinitely)."
             fi
-
-        done < <(find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -print0)
+        done
     fi
 
     log_info "Setup complete. LUKS and the mounted filesystem remain active."
