@@ -23,7 +23,7 @@ MAPPER_NAME="secure_img_api"
 # --- Cleanup & Trap ---
 cleanup() {
     local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
+    if (( exit_code != 0 )); then
         log_warn "Script finished with status code: $exit_code"
     fi
     exit "$exit_code"
@@ -57,7 +57,7 @@ load_config() {
             
             case "$key" in
                 IMG_PATH|MOUNT_POINT|DEFAULT_AUTOLOCK|AUTOLOCK_*)
-                    printf -v "$key" '\%s' "$value" 2>/dev/null || true
+                    printf -v "$key" '%s' "$value" 2>/dev/null || true
                     ;;
             esac
         done < "$cfg"
@@ -65,10 +65,10 @@ load_config() {
 }
 
 check_system_requirements() {
-    if [[ $EUID -ne 0 ]]; then
+    if (( EUID != 0 )); then
         log_err "This script must be executed with root privileges."
         return 1
-    fi
+    }
 
     local required_commands=(cryptsetup mount umount fscrypt realpath mountpoint findmnt)
     for cmd in "${required_commands[@]}"; do
@@ -81,7 +81,7 @@ check_system_requirements() {
 }
 
 resolve_paths() {
-    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] \vert{}\vert{} [[ ! -r "$IMG_PATH" ]]; }; then
+    if [[ -n "$IMG_PATH" ]] && { [[ ! -f "$IMG_PATH" ]] || [[ ! -r "$IMG_PATH" ]]; }; then
         log_warn "Configured image path is invalid or unreadable: $IMG_PATH"
         IMG_PATH=""
     fi
@@ -101,7 +101,7 @@ api_open_luks() {
     if cryptsetup status "$MAPPER_NAME" >/dev/null 2>&1; then
         return 0
     else
-        if [ -t 0 ]; then
+        if [[ -t 0 ]]; then
             cryptsetup luksOpen "$IMG_PATH" "$MAPPER_NAME" || return 1
         else
             cryptsetup luksOpen --key-file - "$IMG_PATH" "$MAPPER_NAME" || return 1
@@ -132,14 +132,13 @@ api_decrypt_fscrypt() {
     local rel_path="$2"
     log_info "Unlocking fscrypt directory: $target_dir"
 
-    # Führe fscrypt genau einmal aus, ohne Endlosschleife
     if fscrypt unlock "$target_dir" --unlock-with-passphrase; then
         local safe_var_name="${rel_path//[^a-zA-Z0-9_]/_}"
         local config_var_name="AUTOLOCK_${safe_var_name}"
         local auto_lock_min="${!config_var_name:-${DEFAULT_AUTOLOCK:-10}}"
 
         if [[ "$auto_lock_min" =~ ^[0-9]+$ ]] && (( auto_lock_min > 0 )); then
-            local expire_epoch=$(($(date +%s) + (auto_lock_min * 60) ))
+            local expire_epoch=$(( $(date +%s) + (auto_lock_min * 60) ))
             echo "$expire_epoch" > "$RUN_DIR/timer_${safe_var_name}"
             
             (
@@ -147,7 +146,7 @@ api_decrypt_fscrypt() {
                 fscrypt lock "$target_dir"
                 rm -f "$RUN_DIR/timer_${safe_var_name}"
             ) &
-            log_info "Auto-timer for '$rel_path' started: locking in$auto_lock_min minutes."
+            log_info "Auto-timer for '$rel_path' started: locking in $auto_lock_min minutes."
         fi
         return 0
     else
@@ -182,7 +181,7 @@ api_output_json_status() {
         local first=true
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$mount_pt/}"
-            [[ "$rel_path" == "lost+found" \vert{}\vert{} "$rel_path" =~ ^\. ]] && continue
+            [[ "$rel_path" == "lost+found" || "$rel_path" =~ ^\. ]] && continue
             
             if check_fscrypt_status "$dir"; then
                 local locked=true
@@ -193,7 +192,7 @@ api_output_json_status() {
                 if [[ "$locked" == "false" && -f "$RUN_DIR/timer_${safe_name}" ]]; then
                     local expire_epoch
                     expire_epoch=$(cat "$RUN_DIR/timer_${safe_name}" 2>/dev/null || echo "0")
-                    rem_sec=$(( expire_epoch -$(date +%s) ))
+                    rem_sec=$(( expire_epoch - $(date +%s) ))
                     (( rem_sec < 0 )) && rem_sec=0
                 elif [[ "$locked" == "false" ]]; then
                     rem_sec=99999
@@ -338,7 +337,7 @@ run_interactive_cli() {
     if [[ -d "$MOUNT_POINT" ]]; then
         while IFS= read -r -d '' dir; do
             local rel_path="${dir#$MOUNT_POINT/}"
-            [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" \vert{}\vert{} "$rel_path" =~ ^\. ]] && continue
+            [[ "$rel_path" == "lost+found" || "$rel_path" == ".fscrypt" || "$rel_path" =~ ^\. ]] && continue
             if check_fscrypt_status "$dir"; then
                 log_info "Detected fscrypt directory: $rel_path"
                 api_decrypt_fscrypt "$dir" "$rel_path" || true
@@ -355,3 +354,7 @@ main() {
         exit 0
     else
         run_interactive_cli "$@"
+    fi
+}
+
+main "$@"
